@@ -427,33 +427,36 @@ class MapPlotter:
 
     def draw_stations(self, min_distance_ratio=0.010):
         """
-        繪製鐵路車站的實體建築與核心範圍。
-        1. 捨棄雜訊過多的 stop_area，嚴格要求 `building=train_station` 或 `railway=station`。
-        2. 終極過濾：如果在 OSM 屬性中「缺乏羅馬拼音/英文名稱」，直接判定為次要設施/雜訊並刪除，完全不畫其多邊形！
-        3. 利用名稱分組，將同名車站的所有合格多邊形融合 (unary_union)，完美達成「抽象車站集合體」的視覺效果。
+        繪製鐵路車站的實體邊界與腹地 (Station Areas/Footprints)。
+        1. 直接採用 OSM PTv2 規範的 public_transport=stop_area，抓取完整的車站抽象集合多邊形。
+        2. 確保沒有孤立的出口節點。
+        3. 保留嚴格的羅馬拼音/英文名稱檢驗，剔除無人維護的雜訊。
+        4. 同名車站 (跨線、跨公司) 合併計算單一中心，日文與英文分兩行顯示。
+        5. 獨立的防衝突機制 (只與其他車站互斥)。
         """
         import pandas as pd
         from shapely.ops import unary_union
 
         if getattr(self, 'gdf_stations', None) is None:
             try:
-                # 🌟 修正 1：改用實體建築與明確的車站邊界，捨棄容易混入廣場與商場的 stop_area 關聯
+                # 🌟 採用終極策略：直接抓取大眾運輸關聯 (stop_area)
                 tags = {
-                    'building': 'train_station',
-                    'railway': 'station'
+                    'public_transport': 'stop_area'
                 }
                 raw_stations = ox.features_from_bbox(bbox=self.bbox, tags=tags) if self.bbox else ox.features_from_point(self.center_point, tags=tags, dist=self.dist)
                 
                 gdf_proj = self._project(raw_stations)
                 
-                # 確保是多邊形，並且不是公車站
+                # 確保是多邊形 (OSMnx 通常會把 Relation 轉為 MultiPolygon)
                 is_polygon = gdf_proj.geometry.type.isin(['Polygon', 'MultiPolygon'])
-                is_bus = pd.Series(False, index=gdf_proj.index)
-                for col in ['highway', 'amenity']:
-                    if col in gdf_proj.columns:
-                        is_bus = is_bus | gdf_proj[col].isin(['bus_station', 'bus_stop'])
                 
-                # 🌟 修正 2：強制名稱檢驗 (沒有英文/羅馬拼音的次要設施、無人維護雜訊，直接在源頭剔除)
+                # 防禦性過濾：確保沒有混入明確的純公車總站 (雖然你觀察到沒有，但加上雙重保險)
+                is_bus = pd.Series(False, index=gdf_proj.index)
+                for col in ['highway', 'amenity', 'bus']:
+                    if col in gdf_proj.columns:
+                        is_bus = is_bus | gdf_proj[col].isin(['bus_station', 'bus_stop', 'yes'])
+                
+                # 嚴格名稱檢驗：必須有羅馬字/英文，避免雜訊
                 def has_required_names(row):
                     pri = row.get('name') or row.get('name:ja')
                     if pd.isna(pri) or not str(pri).strip(): 
@@ -461,31 +464,30 @@ class MapPlotter:
                         
                     for tag in ['name:en', 'name:ja_rm', 'name:ja-Latn', 'name:ja:Latn']:
                         val = row.get(tag)
-                        # 只要找到任何一個有效的英/羅馬字名稱，就判定為「重要且有人維護的核心車站」
                         if pd.notna(val) and str(val).strip().lower() not in ['', 'nan', 'none']:
                             return True
                     return False
                 
                 if not gdf_proj.empty:
                     valid_names = gdf_proj.apply(has_required_names, axis=1)
-                    # 只有同時滿足：是多邊形 + 不是公車 + 擁有英日文雙語名稱，才能存活！
+                    # 篩選條件：是多邊形 + 不是公車站 + 擁有有效雙語站名
                     self.gdf_stations = gdf_proj[is_polygon & ~is_bus & valid_names].copy()
                 else:
                     self.gdf_stations = gdf_proj
 
-                logger.info(f"Loaded {len(self.gdf_stations)} valid station polygons (filtered by building=train_station and strict English name requirements).")
+                logger.info(f"Loaded {len(self.gdf_stations)} valid stop_area polygons.")
                 
             except Exception as e:
-                logger.warning(f"Failed to fetch stations: {e}")
+                logger.warning(f"Failed to fetch stations (stop_area): {e}")
                 self.gdf_stations = None
 
         if self.gdf_stations is not None and not self.gdf_stations.empty:
             scale_factor = self.fig.get_figwidth() / 72.0
             
-            # 🌟 因為已經過濾掉無名雜訊，這裡畫出來的絕對都是乾淨的核心站體！
+            # 🌟 繪製 stop_area 多邊形 (淺灰底色，深灰邊框)
             self.gdf_stations.plot(ax=self.ax, facecolor='#f4f4f5', edgecolor='#52525b', linewidth=1.5 * scale_factor, zorder=3.8)
 
-            # 準備將同名車站的多邊形進行幾何融合
+            # 將同名車站的多邊形進行分組
             station_groups = {}
             for idx, row in self.gdf_stations.iterrows():
                 pri_name = str(row.get('name') or row.get('name:ja')).strip()
@@ -516,8 +518,7 @@ class MapPlotter:
             min_dist = (self.maxx - self.minx) * min_distance_ratio
 
             for (pri_name, sec_name), geoms in station_groups.items():
-                # 🌟 將所有屬於該站名的碎塊、不同鐵路公司的建築，全部聯集(Union)
-                # 完美達成你要求的「包含車站所有建築集合的抽象概念」！
+                # 合併該站名的所有 stop_area，取得幾何總中心
                 merged_geom = unary_union(geoms)
                 center_pt = merged_geom.centroid if merged_geom.contains(merged_geom.centroid) else merged_geom.representative_point()
                 
@@ -541,7 +542,7 @@ class MapPlotter:
                     fontsize=fontsize,
                     ha='center',
                     va='center',
-                    zorder=6.5,
+                    zorder=6.5, # 在最上層圖層
                     clip_on=True,
                     fontfamily='sans-serif',
                     fontweight='bold',
