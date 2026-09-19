@@ -185,7 +185,7 @@ class MapPlotter:
         
         target_levels = [levels] if isinstance(levels, int) else (levels if levels else [4, 6, 7, 8, 9])
         fig_w = self.fig.get_figwidth()
-        scale_factor = fig_w / 72.0
+        scale_factor = fig_w / 48.0
         
         font_size_map = {4: int(72 * scale_factor), 6: int(55 * scale_factor), 7: int(35 * scale_factor), 8: int(22 * scale_factor), 9: int(15 * scale_factor)}
         placed_labels = []
