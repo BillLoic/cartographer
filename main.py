@@ -427,25 +427,42 @@ class MapPlotter:
 
     def draw_stations(self, min_distance_ratio=0.010):
         """
-        繪製鐵路車站與月台。
-        1. 嚴格過濾純軌道設施與月台，絕對不畫公車站與出口。
-        2. 僅畫出多邊形 (Polygon/MultiPolygon) 作為實體站體或月台，不畫孤立節點。
-        3. 同名車站 (跨線、跨公司) 合併計算單一中心，日文與英文分兩行顯示。
-        4. 具備「獨立防衝突機制」(只與其他車站互斥，無視行政區與交流道)。
+        繪製鐵路車站的實體建築與腹地 (Station Areas/Footprints)。
+        1. 精準抓取 public_transport=stop_area 與 building=train_station，以獲得「包含車站所有建築與出口的集合」多邊形。
+        2. 僅畫出多邊形 (Polygon/MultiPolygon)，絕對不畫孤立的出口節點 (Points)。
+        3. 同名車站 (跨線、跨公司) 合併計算單一中心，日文與英文分兩行顯示，無視與其他非車站圖層的衝突。
+        4. 具備「獨立防衝突機制」(只與其他車站互斥)。
         """
         import pandas as pd
         from shapely.ops import unary_union
 
         if getattr(self, 'gdf_stations', None) is None:
             try:
-                # 🌟 修正：精準抓取火車站、高鐵站、地鐵主站點與「實體月台(platform)」
-                # 拔除 public_transport 避免混入公車，拔除 subway_entrance 避免畫出出口
+                # 🌟 終極抓取策略：抓取「車站聚落 (stop_area)」、「火車站建築」與「實體軌道車站」
+                # 這能確保抓到的是一整塊區域，而不是零碎的出口點
                 tags = {
-                    'railway': ['station', 'halt', 'platform'],
-                    'building': ['train_station']
+                    'public_transport': 'stop_area', # 車站的所有建築與出口集合 (通常是 Relation 或 Polygon)
+                    'building': 'train_station',     # 實體的火車站建築物
+                    'railway': 'station'             # 傳統車站標記
                 }
                 raw_stations = ox.features_from_bbox(bbox=self.bbox, tags=tags) if self.bbox else ox.features_from_point(self.center_point, tags=tags, dist=self.dist)
-                self.gdf_stations = self._project(raw_stations)
+                
+                # 投影到目前的座標系
+                gdf_proj = self._project(raw_stations)
+                
+                # 🌟 第一道強制過濾：徹底剔除公車站 (bus_station / bus_stop) 與孤立節點 (Point)
+                # 確保我們只留下「軌道交通相關」的「多邊形集合體」
+                is_polygon = gdf_proj.geometry.type.isin(['Polygon', 'MultiPolygon'])
+                
+                # 檢查是否有 bus 相關屬性，若有則標記為要剔除
+                is_bus = pd.Series(False, index=gdf_proj.index)
+                for col in ['highway', 'amenity']:
+                    if col in gdf_proj.columns:
+                        is_bus = is_bus | gdf_proj[col].isin(['bus_station', 'bus_stop'])
+                
+                self.gdf_stations = gdf_proj[is_polygon & ~is_bus].copy()
+                logger.info(f"Loaded {len(self.gdf_stations)} station area polygons (Points and bus stations excluded).")
+                
             except Exception as e:
                 logger.warning(f"Failed to fetch stations: {e}")
                 self.gdf_stations = None
@@ -453,21 +470,20 @@ class MapPlotter:
         if self.gdf_stations is not None and not self.gdf_stations.empty:
             scale_factor = self.fig.get_figwidth() / 72.0
             
-            # 🌟 修正：分離多邊形與點。但「只繪製」多邊形 (實體站構或月台)！
-            poly_gdf = self.gdf_stations[self.gdf_stations.geometry.type.isin(['Polygon', 'MultiPolygon'])]
+            # 🌟 繪製車站實體腹地與建築 (面狀)
+            # 使用亮灰白底色，蓋在鐵軌之上
+            self.gdf_stations.plot(ax=self.ax, facecolor='#f4f4f5', edgecolor='#52525b', linewidth=1.5 * scale_factor, zorder=3.8)
 
-            if not poly_gdf.empty:
-                # 車站與月台多邊形 (亮灰白底，蓋在鐵軌之上)
-                poly_gdf.plot(ax=self.ax, facecolor='#f4f4f5', edgecolor='#52525b', linewidth=1.5 * scale_factor, zorder=3.8)
-
-            # 🌟 整合車站名稱 (無論是點還是多邊形，只要有名字的都拿來算中心)
+            # 🌟 整合車站名稱 (跨線、跨公司、多個出口多邊形合併)
             station_groups = {}
             for idx, row in self.gdf_stations.iterrows():
+                # 抓取主站名
                 pri_name = row.get('name') or row.get('name:ja')
                 if pd.isna(pri_name) or not str(pri_name).strip():
                     continue
                 pri_name = str(pri_name).strip()
 
+                # 抓取次要站名 (羅馬字)
                 sec_name = ""
                 for tag in ['name:en', 'name:ja_rm', 'name:ja-Latn', 'name:ja:Latn']:
                     val = row.get(tag)
@@ -480,9 +496,8 @@ class MapPlotter:
                     station_groups[key] = []
                 station_groups[key].append(row.geometry)
 
-            # 🌟 標籤字體再度縮小 (原為5，現調為 4.5 比例)
+            # 🌟 標籤字體設定
             fontsize = max(4, int(4.5 * scale_factor))
-            
             bbox_style = dict(
                 facecolor='#18181b', 
                 alpha=0.85, 
@@ -491,11 +506,12 @@ class MapPlotter:
                 boxstyle=f'square,pad={0.15 * scale_factor}'
             )
 
-            # 🌟 獨立的防碰撞清單 (只有車站會互相排斥，重疊行政區也沒關係)
             placed_stations = []
             min_dist = (self.maxx - self.minx) * min_distance_ratio
 
+            # 🌟 繪製合併後的車站標籤
             for (pri_name, sec_name), geoms in station_groups.items():
+                # 將該站的所有實體建築、出口多邊形聯集，取得真正的幾何中心
                 merged_geom = unary_union(geoms)
                 center_pt = merged_geom.centroid if merged_geom.contains(merged_geom.centroid) else merged_geom.representative_point()
                 
@@ -503,12 +519,12 @@ class MapPlotter:
                 if not (self.minx <= x <= self.maxx and self.miny <= y <= self.maxy): 
                     continue
 
-                # 僅針對其他車站進行衝突檢測
+                # 獨立的車站防衝突檢測
                 if any(math.hypot(x - px, y - py) < min_dist for px, py in placed_stations): 
                     continue
                 placed_stations.append((x, y))
 
-                # 🌟 日文與英文分兩行 (\n)，徹底移除 Emoji
+                # 雙行標籤 (\n)，無 Emoji
                 label_text = pri_name
                 if sec_name:
                     label_text += f"\n{sec_name}"
@@ -519,12 +535,12 @@ class MapPlotter:
                     fontsize=fontsize,
                     ha='center',
                     va='center',
-                    zorder=6.5,
+                    zorder=6.5,  # 最高圖層，蓋過道路與地名
                     clip_on=True,
                     fontfamily='sans-serif',
                     fontweight='bold',
                     bbox=bbox_style,
-                    linespacing=1.2  # 確保雙行之間的行距緊湊
+                    linespacing=1.2
                 )
 
         return self
