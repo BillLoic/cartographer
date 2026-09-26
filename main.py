@@ -427,70 +427,81 @@ class MapPlotter:
 
     def draw_stations(self, min_distance_ratio=0.010):
         """
-        繪製鐵路車站的實體邊界與腹地 (Station Areas/Footprints)。
-        1. 直接採用 OSM PTv2 規範的 public_transport=stop_area，抓取完整的車站抽象集合多邊形。
-        2. 確保沒有孤立的出口節點。
-        3. 保留嚴格的羅馬拼音/英文名稱檢驗，剔除無人維護的雜訊。
-        4. 同名車站 (跨線、跨公司) 合併計算單一中心，日文與英文分兩行顯示。
-        5. 獨立的防衝突機制 (只與其他車站互斥)。
+        繪製鐵路車站的完整複合體 (Station Complex)。
+        1. 抓取 stop_area(關聯), train_station(站體), platform(月台)。
+        2. 【繪圖脫鉤】：將所有 LineString (通道/線狀月台) 展開 3 公尺變為走廊，
+           並與所有 Polygon 聯集 (Union)，形成單一乾淨的車站輪廓。自動過濾 Point(出口)。
+        3. 【標籤脫鉤】：獨立計算具備英日雙語站名的幾何中心，將標籤貼於輪廓之上。
         """
         import pandas as pd
+        import geopandas as gpd
         from shapely.ops import unary_union
+        from shapely.geometry import Polygon, MultiPolygon
 
         if getattr(self, 'gdf_stations', None) is None:
             try:
-                # 🌟 採用終極策略：直接抓取大眾運輸關聯 (stop_area)
+                # 🌟 抓取車站複合體的三大核心要素
                 tags = {
-                    'public_transport': 'stop_area'
+                    'public_transport': 'stop_area', # 包含站體、通道與出口的關聯集合
+                    'building': 'train_station',     # 實體建築
+                    'railway': ['station', 'platform'] # 車站節點與月台
                 }
                 raw_stations = ox.features_from_bbox(bbox=self.bbox, tags=tags) if self.bbox else ox.features_from_point(self.center_point, tags=tags, dist=self.dist)
                 
                 gdf_proj = self._project(raw_stations)
                 
-                # 確保是多邊形 (OSMnx 通常會把 Relation 轉為 MultiPolygon)
-                is_polygon = gdf_proj.geometry.type.isin(['Polygon', 'MultiPolygon'])
-                
-                # 防禦性過濾：確保沒有混入明確的純公車總站 (雖然你觀察到沒有，但加上雙重保險)
+                # 剔除公車相關設施 (避免 stop_area 混入公車總站)
                 is_bus = pd.Series(False, index=gdf_proj.index)
-                for col in ['highway', 'amenity', 'bus']:
+                for col in ['highway', 'amenity']:
                     if col in gdf_proj.columns:
-                        is_bus = is_bus | gdf_proj[col].isin(['bus_station', 'bus_stop', 'yes'])
+                        is_bus = is_bus | gdf_proj[col].isin(['bus_station', 'bus_stop'])
                 
-                # 嚴格名稱檢驗：必須有羅馬字/英文，避免雜訊
-                def has_required_names(row):
-                    pri = row.get('name') or row.get('name:ja')
-                    if pd.isna(pri) or not str(pri).strip(): 
-                        return False
-                        
-                    for tag in ['name:en', 'name:ja_rm', 'name:ja-Latn', 'name:ja:Latn']:
-                        val = row.get(tag)
-                        if pd.notna(val) and str(val).strip().lower() not in ['', 'nan', 'none']:
-                            return True
-                    return False
-                
-                if not gdf_proj.empty:
-                    valid_names = gdf_proj.apply(has_required_names, axis=1)
-                    # 篩選條件：是多邊形 + 不是公車站 + 擁有有效雙語站名
-                    self.gdf_stations = gdf_proj[is_polygon & ~is_bus & valid_names].copy()
-                else:
-                    self.gdf_stations = gdf_proj
-
-                logger.info(f"Loaded {len(self.gdf_stations)} valid stop_area polygons.")
+                self.gdf_stations = gdf_proj[~is_bus].copy()
+                logger.info(f"Loaded {len(self.gdf_stations)} station features (building, platform, stop_area).")
                 
             except Exception as e:
-                logger.warning(f"Failed to fetch stations (stop_area): {e}")
+                logger.warning(f"Failed to fetch stations: {e}")
                 self.gdf_stations = None
 
         if self.gdf_stations is not None and not self.gdf_stations.empty:
             scale_factor = self.fig.get_figwidth() / 72.0
             
-            # 🌟 繪製 stop_area 多邊形 (淺灰底色，深灰邊框)
-            self.gdf_stations.plot(ax=self.ax, facecolor='#f4f4f5', edgecolor='#52525b', linewidth=1.5 * scale_factor, zorder=3.8)
+            # ==========================================
+            # 第一階段：視覺渲染 (融合站體、月台與通道)
+            # ==========================================
+            render_geoms = []
+            
+            for idx, row in self.gdf_stations.iterrows():
+                geom = row.geometry
+                if geom.is_empty:
+                    continue
+                    
+                # 點 (Point)：通常是孤立出口或標籤錨點，絕對不畫 (避免滿地出口)
+                if geom.geom_type in ['Point', 'MultiPoint']:
+                    continue
+                # 線 (LineString)：通道或線狀月台。給予 3 公尺的緩衝 (Buffer)，變成 6 公尺寬的實體走廊！
+                elif geom.geom_type in ['LineString', 'MultiLineString']:
+                    render_geoms.append(geom.buffer(3.0)) # 因為已是投影座標，單位為公尺
+                # 面 (Polygon)：標準站體與大月台，直接加入
+                elif geom.geom_type in ['Polygon', 'MultiPolygon']:
+                    render_geoms.append(geom)
 
-            # 將同名車站的多邊形進行分組
+            if render_geoms:
+                # 🌟 透過聯集 (unary_union) 消除內部重疊的邊界，把所有碎片融合成一個乾淨的「車站複合體」
+                merged_footprint = unary_union(render_geoms)
+                
+                # 將融合後的巨大多邊形包裝回 GeoDataFrame 並繪製
+                footprint_gdf = gpd.GeoDataFrame(geometry=[merged_footprint], crs=self.gdf_stations.crs)
+                footprint_gdf.plot(ax=self.ax, facecolor='#f4f4f5', edgecolor='#52525b', linewidth=1.5 * scale_factor, zorder=3.8)
+
+            # ==========================================
+            # 第二階段：站名標籤處理 (精準命名與防衝突)
+            # ==========================================
             station_groups = {}
             for idx, row in self.gdf_stations.iterrows():
                 pri_name = str(row.get('name') or row.get('name:ja')).strip()
+                if not pri_name or pri_name.lower() in ['nan', 'none']:
+                    continue
                 
                 sec_name = ""
                 for tag in ['name:en', 'name:ja_rm', 'name:ja-Latn', 'name:ja:Latn']:
@@ -499,12 +510,16 @@ class MapPlotter:
                         sec_name = str(val).strip()
                         break
                 
+                # 🌟 嚴格要求：只有具備英文/羅馬字的主站，才有資格被標上名字
+                if not sec_name:
+                    continue
+                    
                 key = (pri_name, sec_name)
                 if key not in station_groups:
                     station_groups[key] = []
+                # 把具備名字的節點、多邊形收集起來，用來算標籤的中心點
                 station_groups[key].append(row.geometry)
 
-            # 標籤字體設定
             fontsize = max(4, int(4.5 * scale_factor))
             bbox_style = dict(
                 facecolor='#18181b', 
@@ -518,7 +533,6 @@ class MapPlotter:
             min_dist = (self.maxx - self.minx) * min_distance_ratio
 
             for (pri_name, sec_name), geoms in station_groups.items():
-                # 合併該站名的所有 stop_area，取得幾何總中心
                 merged_geom = unary_union(geoms)
                 center_pt = merged_geom.centroid if merged_geom.contains(merged_geom.centroid) else merged_geom.representative_point()
                 
@@ -526,15 +540,11 @@ class MapPlotter:
                 if not (self.minx <= x <= self.maxx and self.miny <= y <= self.maxy): 
                     continue
 
-                # 獨立的車站防衝突檢測
                 if any(math.hypot(x - px, y - py) < min_dist for px, py in placed_stations): 
                     continue
                 placed_stations.append((x, y))
 
-                # 雙行標籤
-                label_text = pri_name
-                if sec_name:
-                    label_text += f"\n{sec_name}"
+                label_text = pri_name + f"\n{sec_name}"
 
                 self.ax.text(
                     x, y, label_text,
@@ -542,7 +552,7 @@ class MapPlotter:
                     fontsize=fontsize,
                     ha='center',
                     va='center',
-                    zorder=6.5, # 在最上層圖層
+                    zorder=6.5,
                     clip_on=True,
                     fontfamily='sans-serif',
                     fontweight='bold',
@@ -1082,4 +1092,4 @@ if __name__ == "__main__":
                 
     decorate_map_layout(plotter_utm.fig, plotter_utm.ax, plotter_utm, "Tokyo Metropoliton Sub-area Map")
     plotter_utm.fig.patch.set_facecolor("#091c15")
-    plt.savefig("tokyo_map_2.png", dpi=200, facecolor=plotter_utm.fig.get_facecolor(), edgecolor='none')
+    plt.savefig("tokyo_map_3.png", dpi=200, facecolor=plotter_utm.fig.get_facecolor(), edgecolor='none')
