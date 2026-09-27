@@ -18,11 +18,11 @@ plt.rcParams['axes.unicode_minus'] = False
 
 # Configure basic logging
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] [%(name)s] -> %(message)s",
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] [%(name)s] [%(filename)s:%(lineno)s] -> %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
-logger = logging.getLogger("MapPlotter")
+logger = logging.getLogger("GenericPlotter")
 ox.settings.use_cache = True
 
 # ==========================================
