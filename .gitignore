@@ -6,3 +6,4 @@ venv/*
 *.py[codz]
 
 *.png
+apikey

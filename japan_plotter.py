@@ -13,7 +13,8 @@ from shapely.ops import unary_union
 from pyproj import Transformer
 from generic_plotter import GenericMapPlotter, logger, decorate_map_layout
 
-
+# 推薦字體順序：Noto Sans JP (思源黑體) -> Hiragino Sans (蘋果內建冬青黑體) -> Meiryo (微軟內建)
+plt.rcParams['font.sans-serif'] = ['Noto Sans JP', 'Hiragino Sans', 'Meiryo', 'Source Han Sans JP', 'sans-serif']
 # ==========================================
 # JapanMapPlotter: Cultural & Human Geography
 # ==========================================
@@ -24,7 +25,7 @@ class JapanMapPlotter(GenericMapPlotter):
     """
     def __init__(self, bbox=None, center_point=None, dist=5000, 
                  custom_linewidths=None, custom_colors=None, 
-                 bg_color="#8FA8DA", land_color="#a6dcca", 
+                 bg_color="#d1e2f8", land_color="#f8fafc", 
                  admin_widths=(0, 0, 0, 0, 0, 0, 2.5, 0, 0.5, 0), 
                  projection="wgs84"):
         
@@ -66,6 +67,10 @@ class JapanMapPlotter(GenericMapPlotter):
             self._admins_fetched = True
 
     def draw_admins(self):
+        """
+        繪製日本行政區邊界與多層次底色。
+        利用 Z-order 將填色層放在水域之下，完美解決町丁延伸到海裡的問題。
+        """
         self._fetch_and_categorize_admins()
         for i, width in enumerate(self.admin_widths):
             level = i + 1 
@@ -79,20 +84,32 @@ class JapanMapPlotter(GenericMapPlotter):
                 random.seed(42 + level); random.shuffle(color_ids)
                 gdf = gdf.copy()
                 gdf['color_id'] = color_ids
-                alpha_val = {7: 0.06, 8: 0.12, 9: 0.25}.get(level, 0.1)
-                gdf.plot(ax=self.ax, column='color_id', cmap='hsv', alpha=alpha_val, edgecolor='none', zorder=0.3 + (level * 0.001))
+                
+                alpha_val = {7: 0.05, 8: 0.2, 9: 0.4}.get(level, 0.1)
+                
+                # 🌟 關鍵修正：zorder=0.15，這樣會被 zorder=0.20 的水域蓋住！
+                gdf.plot(ax=self.ax, column='color_id', cmap='Pastel2', alpha=alpha_val, edgecolor='none', zorder=0.15 + (level * 0.001))
             
-            gdf.plot(ax=self.ax, facecolor='none', edgecolor="#776de5", linewidth=width, linestyle='-.', zorder=0.35 + (level * 0.01))
+            gdf.plot(ax=self.ax, facecolor='none', edgecolor="#94a3b8", linewidth=width, linestyle='-.', alpha=0.8, zorder=0.201 + (level * 0.001))
+            
         return self
 
     def draw_admin_labels(self, levels=(4, 6, 7, 8, 9), min_distance_ratio=0.015):
+        """
+        繪製各級行政區地名。
+        移除陰影，使用單一文字物件進行雙行排版，徹底解決距離衝突。
+        """
+        import pandas as pd
+        from shapely.geometry import MultiPolygon
+        import re
+
         if self.ax is None: raise ValueError("Canvas not found.")
         self._fetch_and_categorize_admins()
         
         target_levels = [levels] if isinstance(levels, int) else (levels if levels else [4, 6, 7, 8, 9])
         scale_factor = self.fig.get_figwidth() / 48.0
         
-        font_size_map = {4: int(72 * scale_factor), 6: int(55 * scale_factor), 7: int(35 * scale_factor), 8: int(22 * scale_factor), 9: int(15 * scale_factor)}
+        font_size_map = {4: int(72 * scale_factor), 6: int(55 * scale_factor), 7: int(35 * scale_factor), 8: int(27 * scale_factor), 9: int(12 * scale_factor)}
         placed_labels = []
         min_dist = (self.maxx - self.minx) * min_distance_ratio 
 
@@ -101,7 +118,8 @@ class JapanMapPlotter(GenericMapPlotter):
             if gdf is None or gdf.empty: continue
                 
             pri_fontsize = font_size_map.get(level, int(8 * scale_factor))
-            sec_fontsize = max(int(4 * scale_factor), int(pri_fontsize * 0.6))
+            # 羅馬拼音稍微縮小
+            sec_fontsize = max(int(4 * scale_factor), int(pri_fontsize * 0.65))
 
             for idx, row in gdf.iterrows():
                 geom = row.geometry
@@ -118,6 +136,8 @@ class JapanMapPlotter(GenericMapPlotter):
                         
                 if sec_name and level == 9: sec_name = sec_name.upper()
                 if isinstance(geom, MultiPolygon): geom = max(geom.geoms, key=lambda p: p.area)
+                
+                # 確保中心點落在陸地上 (避免海上標籤)
                 center_pt = geom.centroid if geom.contains(geom.centroid) else geom.representative_point()
                 x, y = center_pt.x, center_pt.y
 
@@ -130,9 +150,20 @@ class JapanMapPlotter(GenericMapPlotter):
                     sec_name = (_splited[0][0].upper() + ".-") + "-".join(_splited[1:])
                 if len(pri_name) < 4: pri_name = " ".join(pri_name)
 
-                halo = [pe.withStroke(linewidth=3.5 * scale_factor, foreground="#091c15")]
-                self.ax.text(x, y, pri_name, color="white", fontsize=pri_fontsize, ha='center', va='bottom', zorder=6.0, clip_on=True, fontfamily='sans-serif', fontweight='bold', path_effects=halo)
-                if sec_name: self.ax.text(x, y, sec_name, color="#cbd5e1", fontsize=sec_fontsize, ha='center', va='top', zorder=6.0, clip_on=True, fontfamily='sans-serif', fontweight='normal', path_effects=halo)
+                # 🌟 關鍵修正：不用陰影，改用沉穩的文字顏色，並用 \n 合併
+                # 設定顏色 (如果你的地圖底色是淺色，這裡用深鐵灰色 #334155 會非常有質感)
+                text_color = "#334155" 
+                
+                if sec_name:
+                    # 使用富文本或多行方式 (Matplotlib 同一 text 只能有一個 fontsize，所以我們用兩次 text，但錨點對齊)
+                    # 為了精準控制，依然拆分兩行，但這次用絕對相對位移
+                    y_offset = (self.maxx - self.minx) * 0.0005 * scale_factor
+                    
+                    self.ax.text(x, y + y_offset, pri_name, color=text_color, fontsize=pri_fontsize, ha='center', va='bottom', zorder=6.0, clip_on=True, fontweight='bold', alpha=0.85)
+                    self.ax.text(x, y - y_offset, sec_name, color=text_color, fontsize=sec_fontsize, ha='center', va='top', zorder=6.0, clip_on=True, fontweight='normal', alpha=0.7)
+                else:
+                    self.ax.text(x, y, pri_name, color=text_color, fontsize=pri_fontsize, ha='center', va='center', zorder=6.0, clip_on=True, fontweight='bold', alpha=0.85)
+
         return self
     
     def draw_railways(self):

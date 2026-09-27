@@ -86,7 +86,7 @@ class GenericMapPlotter:
     """
     def __init__(self, bbox=None, center_point=None, dist=5000, 
                  custom_linewidths=None, custom_colors=None, 
-                 bg_color="#8FA8DA", land_color="#a6dcca", projection="wgs84"):
+                 bg_color="#cfe4fe", land_color="#54ead1", projection="wgs84"):
         
         if (bbox is None) == (center_point is None):
             raise ValueError("You must provide either 'bbox' OR 'center_point'.")
@@ -223,10 +223,19 @@ class GenericMapPlotter:
         return self
 
     def draw_land(self):
-        if self.gdf_admin_base is None:
-            self.gdf_admin_base = self._project(gpd.GeoDataFrame(geometry=[box(self.minx, self.miny, self.maxx, self.maxy)], crs="EPSG:4326"))
+        """
+        繪製基底陸地圖層。
+        修正座標系 Bug：直接使用當前畫布的 self.crs，避免重複投影導致陸地消失。
+        """
+        if getattr(self, 'gdf_admin_base', None) is None:
+            # 🌟 關鍵修正：邊界已經是當前投影座標了，直接套用 self.crs，絕對不要再 _project！
+            poly = box(self.minx, self.miny, self.maxx, self.maxy)
+            self.gdf_admin_base = gpd.GeoDataFrame(geometry=[poly], crs=self.crs)
+            
         if not self.gdf_admin_base.empty:
+            # zorder=0.1 鋪在最底層，作為真正的陸地顏色
             self.gdf_admin_base.plot(ax=self.ax, color=self.land_color, zorder=0.1)
+            
         return self
 
     def draw_water(self):
@@ -340,7 +349,7 @@ class GenericMapPlotter:
                 self.ax.text(x, y, str(row['ref']).strip(), color=fontcolor, fontsize=fontsize, ha='center', va='center', rotation=angle, zorder=z, clip_on=True, fontfamily='sans-serif', fontweight=fontweight, bbox=bbox_style)
         return self
 
-    def draw_grid(self, rows=5, cols=5, color="#ffffff", alpha=0.15, linewidth=0.8):
+    def draw_grid(self, rows=5, cols=5, color="#8072ff", alpha=0.15, linewidth=0.8):
         if self.ax is None: raise ValueError("Canvas not found.")
         
         self.grid_cells = {}
