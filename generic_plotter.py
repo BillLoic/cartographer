@@ -38,13 +38,13 @@ def _compute_ground_metrics(minx, miny, maxx, maxy, crs):
         sin_lat = math.sin(center_lat)
         N = a / math.sqrt(1.0 - e_sq * sin_lat**2)
         M = (a * (1.0 - e_sq)) / math.pow(1.0 - e_sq * sin_lat**2, 1.5)
-        
+
         ground_w_m = math.radians(maxx - minx) * N * math.cos(center_lat)
         ground_h_m = math.radians(maxy - miny) * M
     else:
         ground_w_m = maxx - minx
         ground_h_m = maxy - miny
-        
+
     return ground_w_m, ground_h_m
 
 def decorate_map_layout(fig, ax, plotter, title_text="Urban Map"):
@@ -87,20 +87,20 @@ class GenericMapPlotter:
     def __init__(self, bbox=None, center_point=None, dist=5000, 
                  custom_linewidths=None, custom_colors=None, 
                  bg_color="#cfe4fe", land_color="#54ead1", projection="wgs84"):
-        
+
         if (bbox is None) == (center_point is None):
             raise ValueError("You must provide either 'bbox' OR 'center_point'.")
 
         self.bbox = bbox
         self.center_point = center_point
         self.dist = dist
-        
+
         if self.center_point: self._check_center_point()
         if self.bbox: self._check_bbox()
-            
+
         self.bg_color = bg_color
         self.land_color = land_color
-        
+
         self.linewidths_map = {
             'motorway': 4.0, 'motorway_link': 3.0, 'trunk': 3.5, 'trunk_link': 2.5,
             'primary': 2.5,  'primary_link': 2.0, 'secondary': 1.5,'secondary_link': 1.0,
@@ -118,7 +118,7 @@ class GenericMapPlotter:
             'residential': '#555555', 'unclassified': '#555555', 'living_street': '#555555'
         }
         if custom_colors: self.color_map.update(custom_colors)
-            
+
         self.projection = projection.lower()
         self.crs = "EPSG:4326" 
 
@@ -135,7 +135,7 @@ class GenericMapPlotter:
         self.ax = None
         self._is_user_ax = False
         self.minx = self.miny = self.maxx = self.maxy = 0
-        
+
         mode_str = f"BBox mode ({self.bbox})" if self.bbox else f"Center Point mode ({self.center_point}, {self.dist}m)"
         logger.info(f"GenericMapPlotter initialized with {mode_str} | Projection: {self.projection.upper()}")
 
@@ -162,28 +162,49 @@ class GenericMapPlotter:
         for u, v, k, data in self.G.edges(keys=True, data=True):
             hw = data.get('highway', 'unclassified')
             hw = hw[0] if isinstance(hw, list) else (str(hw.iloc[0]) if hasattr(hw, 'iloc') else hw)
-                
+
             is_bridge, is_tunnel = self._check_is_yes(data.get('bridge')), self._check_is_yes(data.get('tunnel'))
             width = self.linewidths_map.get(hw, 0.5)
-            
+
             if is_tunnel: color, zorder = self.color_map.get(hw, '#ff9999'), 1      
             elif is_bridge: color, zorder = self.color_map.get(hw, '#ff9999'), 3        
             else: color, zorder = self.color_map.get(hw, '#666666'), 2        
-                
+
             edge_widths.append(width); edge_colors.append(color); edge_zorders.append(zorder)
 
         self.gdf_edges['custom_width'] = edge_widths
         self.gdf_edges['custom_color'] = edge_colors
         self.gdf_edges['custom_zorder'] = edge_zorders
 
+    def _fetch_features(self, tags, layer_name):
+        """
+        共用的圖層抓取邏輯。
+        若區域內真的沒有該標籤資料，安全回傳 None。
+        但若是遭遇網路斷線、API 超時等致命錯誤，將強制拋出例外中止程式。
+        """
+        try:
+            raw = ox.features_from_bbox(bbox=self.bbox, tags=tags) if self.bbox else ox.features_from_point(self.center_point, tags=tags, dist=self.dist)
+            return self._project(raw)
+        except Exception as e:
+            err_msg = str(e).lower()
+            # 判斷是否為「查無資料」的良性例外 (OSMnx 在抓不到特徵時會拋出此類錯誤)
+            if any(keyword in err_msg for keyword in ['no data', 'empty', 'insufficient', 'not find', 'no features']):
+                logger.info(f"No features found for {layer_name} in this area.")
+                return None
+            else:
+                # 遭遇網路問題或其他底層致命錯誤，不再吞掉，直接報錯
+                logger.error(f"Fatal error encountered while fetching {layer_name}: {e}")
+                raise e
+
     def setup_canvas(self, ax=None, base_width=96, highway_filter=None):
         custom_filter = f'["highway"~"{"|".join(highway_filter)}"]' if highway_filter else None
 
+        # graph_from_bbox 若發生網路錯誤，本身就會直接噴出 requests 或 urllib 錯誤
         if self.bbox:
             self.G = ox.graph_from_bbox(bbox=self.bbox, network_type="drive", custom_filter=custom_filter)
         else:
             self.G = ox.graph_from_point(self.center_point, dist=self.dist, network_type="drive", custom_filter=custom_filter)
-        
+
         if self.projection != "wgs84":
             if self.projection in ["utm", "transverse_mercator"]:
                 self.G = ox.project_graph(self.G) 
@@ -194,7 +215,7 @@ class GenericMapPlotter:
 
         self.gdf_nodes, self.gdf_edges = ox.graph_to_gdfs(self.G)
         if self.gdf_nodes.empty: raise ValueError("Invalid graph bounds: No road nodes found.")
-            
+
         self._process_edges()
         self.minx, self.miny, self.maxx, self.maxy = self.gdf_nodes.total_bounds 
 
@@ -202,7 +223,7 @@ class GenericMapPlotter:
             ground_w, ground_h = _compute_ground_metrics(self.minx, self.miny, self.maxx, self.maxy, self.crs)
             aspect_ratio = ground_h / ground_w 
             fig_height = base_width * aspect_ratio
-            
+
             self.fig, self.ax = plt.subplots(figsize=(base_width, fig_height))
             self.fig.subplots_adjust(left=0, right=1, bottom=0, top=0.99)
             self._is_user_ax = False
@@ -210,11 +231,11 @@ class GenericMapPlotter:
             self.ax = ax
             self.fig = ax.figure
             self._is_user_ax = True
-        
+
         self.ax.set_xlim([self.minx, self.maxx])
         self.ax.set_ylim([self.miny, self.maxy])
         self.ax.set_facecolor(self.bg_color)
-        
+
         if self.crs == "EPSG:4326":
             self.ax.set_aspect(1.0 / math.cos(math.radians((self.miny + self.maxy) / 2.0))) 
         else:
@@ -223,41 +244,27 @@ class GenericMapPlotter:
         return self
 
     def draw_land(self):
-        """
-        繪製基底陸地圖層。
-        修正座標系 Bug：直接使用當前畫布的 self.crs，避免重複投影導致陸地消失。
-        """
         if getattr(self, 'gdf_admin_base', None) is None:
-            # 🌟 關鍵修正：邊界已經是當前投影座標了，直接套用 self.crs，絕對不要再 _project！
             poly = box(self.minx, self.miny, self.maxx, self.maxy)
             self.gdf_admin_base = gpd.GeoDataFrame(geometry=[poly], crs=self.crs)
             
         if not self.gdf_admin_base.empty:
-            # zorder=0.1 鋪在最底層，作為真正的陸地顏色
             self.gdf_admin_base.plot(ax=self.ax, color=self.land_color, zorder=0.1)
-            
         return self
 
     def draw_water(self):
         if self.gdf_water is None:
-            try:
-                tags = {'natural': ['water', 'bay', 'coastline'], 'waterway': ['river', 'riverbank', 'canal', 'dock'], 'water': True}
-                raw_water = ox.features_from_bbox(bbox=self.bbox, tags=tags) if self.bbox else ox.features_from_point(self.center_point, tags=tags, dist=self.dist)
-                self.gdf_water = self._project(raw_water)
-            except Exception:
-                self.gdf_water = None
+            tags = {'natural': ['water', 'bay', 'coastline'], 'waterway': ['river', 'riverbank', 'canal', 'dock'], 'water': True}
+            self.gdf_water = self._fetch_features(tags, layer_name="water")
+            
         if self.gdf_water is not None and not self.gdf_water.empty:
             self.gdf_water.plot(ax=self.ax, color=self.bg_color, edgecolor='none', zorder=0.2)
         return self
 
     def draw_greenery(self):
         if getattr(self, 'gdf_greenery', None) is None:
-            try:
-                tags = {'leisure': ['park', 'pitch', 'garden', 'golf_course'], 'landuse': ['forest', 'grass', 'cemetery', 'recreation_ground'], 'natural': ['wood', 'scrub']}
-                raw_green = ox.features_from_bbox(bbox=self.bbox, tags=tags) if self.bbox else ox.features_from_point(self.center_point, tags=tags, dist=self.dist)
-                self.gdf_greenery = self._project(raw_green)
-            except Exception:
-                self.gdf_greenery = None
+            tags = {'leisure': ['park', 'pitch', 'garden', 'golf_course'], 'landuse': ['forest', 'grass', 'cemetery', 'recreation_ground'], 'natural': ['wood', 'scrub']}
+            self.gdf_greenery = self._fetch_features(tags, layer_name="greenery")
 
         if self.gdf_greenery is not None and not self.gdf_greenery.empty:
             poly_gdf = self.gdf_greenery[self.gdf_greenery.geometry.type.isin(['Polygon', 'MultiPolygon'])]
@@ -267,12 +274,8 @@ class GenericMapPlotter:
 
     def draw_buildings(self):
         if getattr(self, 'gdf_buildings', None) is None:
-            try:
-                tags = {'building': True}
-                raw_bldgs = ox.features_from_bbox(bbox=self.bbox, tags=tags) if self.bbox else ox.features_from_point(self.center_point, tags=tags, dist=self.dist)
-                self.gdf_buildings = self._project(raw_bldgs)
-            except Exception:
-                self.gdf_buildings = None
+            tags = {'building': True}
+            self.gdf_buildings = self._fetch_features(tags, layer_name="buildings")
 
         if self.gdf_buildings is not None and not self.gdf_buildings.empty:
             poly_gdf = self.gdf_buildings[self.gdf_buildings.geometry.type.isin(['Polygon', 'MultiPolygon'])]
@@ -292,15 +295,11 @@ class GenericMapPlotter:
         if not gdf_ground.empty: gdf_ground.plot(ax=self.ax, color=gdf_ground['custom_color'], linewidth=gdf_ground['custom_width'], zorder=2.0)
         if not gdf_bridges.empty: gdf_bridges.plot(ax=self.ax, color=gdf_bridges['custom_color'], linewidth=gdf_bridges['custom_width'], zorder=3.0)
         return self
-    
+
     def draw_airports(self):
         if getattr(self, 'gdf_aeroway', None) is None:
-            try:
-                tags = {'aeroway': ['runway', 'taxiway', 'apron', 'helipad']}
-                raw_aero = ox.features_from_bbox(bbox=self.bbox, tags=tags) if self.bbox else ox.features_from_point(self.center_point, tags=tags, dist=self.dist)
-                self.gdf_aeroway = self._project(raw_aero)
-            except Exception:
-                self.gdf_aeroway = None
+            tags = {'aeroway': ['runway', 'taxiway', 'apron', 'helipad']}
+            self.gdf_aeroway = self._fetch_features(tags, layer_name="airports")
 
         if self.gdf_aeroway is None or self.gdf_aeroway.empty: return self
 
@@ -328,7 +327,7 @@ class GenericMapPlotter:
                 if 'ref' not in row or pd.isna(row['ref']) or not str(row['ref']).strip(): continue
                 geom = row.geometry
                 if geom.is_empty: continue
-                
+
                 center_pt = geom.centroid
                 x, y = center_pt.x, center_pt.y
                 if not (self.minx <= x <= self.maxx and self.miny <= y <= self.maxy): continue
@@ -351,12 +350,12 @@ class GenericMapPlotter:
 
     def draw_grid(self, rows=5, cols=5, color="#8072ff", alpha=0.15, linewidth=0.8):
         if self.ax is None: raise ValueError("Canvas not found.")
-        
+
         self.grid_cells = {}
         x_steps = [self.minx + i * (self.maxx - self.minx) / cols for i in range(cols + 1)]
         y_steps = [self.miny + j * (self.maxy - self.miny) / rows for j in range(rows + 1)]
         cols_labels = [chr(65 + i) for i in range(cols)]
-        
+
         for i in range(cols + 1):
             self.ax.plot([x_steps[i], x_steps[i]], [self.miny, self.maxy], color=color, alpha=alpha, linewidth=linewidth, linestyle='--', zorder=5.0)
             if i < cols: self.ax.text(x_steps[i] + (self.maxx - self.minx) / (cols * 2.0), self.maxy, cols_labels[i], color=color, alpha=0.7, fontsize=9, ha='center', va='bottom', zorder=5.0, fontfamily='monospace')
@@ -372,7 +371,7 @@ class GenericMapPlotter:
 
     def draw_coordinates(self):
         if self.ax is None: raise ValueError("Canvas not found.")
-        
+
         if self.crs != "EPSG:4326":
             to_wgs84, to_map = Transformer.from_crs(self.crs, "EPSG:4326", always_xy=True), Transformer.from_crs("EPSG:4326", self.crs, always_xy=True)
             w, s = to_wgs84.transform(self.minx, self.miny)
@@ -383,7 +382,7 @@ class GenericMapPlotter:
 
         span = min(e - w, n - s)
         interval = 1 / 120.0 if span < 0.05 else (1 / 60.0 if span < 0.1 else (5 / 60.0 if span < 0.5 else 0.1))
-        
+
         def format_dms(val_orig, is_lat):
             val = abs(val_orig)
             deg, mins_float = int(val), (val - int(val)) * 60
@@ -422,7 +421,7 @@ class GenericMapPlotter:
     def draw_scale(self, x_offset=0.08, y_offset=0.08, color="white", font_size=9):
         if self.ax is None or self.fig is None: raise ValueError("Canvas not found.")
         self.fig.canvas.draw() if self.fig.canvas else None
-        
+
         map_w, map_h = _get_actual_ax_size_cm(self.fig, self.ax)
         grd_w, grd_h = _compute_ground_metrics(self.minx, self.miny, self.maxx, self.maxy, self.crs)
 
@@ -455,5 +454,3 @@ class GenericMapPlotter:
         if self.ax is None: raise ValueError("Canvas not found.")
         self.ax.set_axis_off()
         return self
-
-
