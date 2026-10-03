@@ -11,17 +11,17 @@ This is a robust, object-oriented **g**eographic **i**nformation **s**ystem (GIS
 
 The framework is strictly built on **Object-Oriented Programming (OOP)** principles. It separates the core physical geography rendering engine from human-geography logic, allowing for highly specialized, region-specific map plotters (e.g., Japan, UK, Hong Kong/Macau) using inheritance.
 
- - Fluent Interface (Method Chaining): Build maps elegantly by chaining rendering methods sequentially (e.g., .setup_canvas().draw_land().draw_water().render()).
+ - Fluent Interface (Method Chaining): Build maps elegantly by chaining rendering methods sequentially (e.g., `.setup_canvas().draw_land().draw_water().render()`).
 
  - Smart Z-Order Masking: Automatically clips administrative boundaries and land features underneath water bodies to prevent colors from bleeding into oceans and rivers.
 
  - Advanced Topographic Rendering: Support for Digital Elevation Models (DEM) via rasterio and earthpy to generate stunning, terrain-aware macro maps with shaded reliefs (hillshading).
 
- - Dynamic Spatial Indexing: Automatically generates alphanumeric reference grids (e.g., A1, B3) and perfectly projected WGS84 coordinates (Degree-Minute-Second) along the canvas borders.
+ - Dynamic Spatial Indexing: Automatically generates alphanumeric reference grids (e.g., `A1`, `B3`) and perfectly projected WGS84 coordinates (Degree-Minute-Second) along the canvas borders.
 
- - Multi-Lingual Typography: Employs sophisticated text alignment and halo effects (path_effects) to render collision-free, dual-language labels (e.g., Japanese/Romaji, Traditional Chinese/English).
+ - Multi-Lingual Typography: Employs sophisticated text alignment and halo effects (`path_effects`) to render collision-free, dual-language labels (e.g., Japanese/Romaji, Traditional Chinese/English).
 
- - Robust Network & Exception Handling: Built-in safe-fetching (_fetch_features) that gracefully ignores empty data areas while strictly raising fatal network/API timeout exceptions.
+ - Robust Network & Exception Handling: Built-in safe-fetching (`_fetch_features`) that gracefully ignores empty data areas while strictly raising fatal network/API timeout exceptions.
 
  - Smart OSM Caching: Integrates osmnx caching to prevent redundant API calls, vastly speeding up the styling and iteration process.
 
