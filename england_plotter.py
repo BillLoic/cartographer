@@ -320,4 +320,4 @@ if __name__ == "__main__":
             
     decorate_map_layout(plotter.fig, plotter.ax, plotter, "London Metropoliton Sub-area Map")
     plotter.fig.patch.set_facecolor("#091c15")
-    plt.savefig("LHR.png", dpi=200, facecolor=plotter.fig.get_facecolor(), edgecolor='none')
+    plt.savefig("London.png", dpi=200, facecolor=plotter.fig.get_facecolor(), edgecolor='none')
