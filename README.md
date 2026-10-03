@@ -100,4 +100,5 @@ I have only implemented three countries right now. I learned the country-specifi
  - Enable it to draw macro maps.
  - Enable building indexing system.
  - Polish the scales.
+ - Break the Babel, change docstrings to English.
  - ...(Haven't thought of.)
