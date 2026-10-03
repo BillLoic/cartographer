@@ -13,7 +13,7 @@ from shapely.ops import unary_union
 from pyproj import Transformer
 from generic_plotter import GenericMapPlotter, logger, decorate_map_layout
 
-# 推薦字體順序：Noto Sans JP (思源黑體) -> Hiragino Sans (蘋果內建冬青黑體) -> Meiryo (微軟內建)
+# Recommended fonts order: Noto Sans JP -> Hiragino Sans -> Meiryo
 plt.rcParams['font.sans-serif'] = ['Noto Sans JP', 'Hiragino Sans', 'Meiryo', 'Source Han Sans JP', 'sans-serif']
 # ==========================================
 # JapanMapPlotter: Cultural & Human Geography

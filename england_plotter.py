@@ -291,15 +291,14 @@ class EnglandMapPlotter(GenericMapPlotter):
         return self
     
 if __name__ == "__main__":
-    # Heathrow Airport (LHR)
-    bbox = (-0.51009, 51.44842, -0.41482, 51.48293)
+    bbox = (-0.289903, 51.419445, -0.216056, 51.527777)
     
     plotter = EnglandMapPlotter(
         bbox=bbox,
         projection="utm"
     )
     
-    (plotter.setup_canvas(base_width=96)
+    (plotter.setup_canvas(base_width=48)
             .draw_land()
             .draw_greenery()
             .draw_buildings()
