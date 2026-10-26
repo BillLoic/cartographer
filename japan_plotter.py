@@ -1,320 +1,1166 @@
-import warnings
+"""
+japan_plotter.py
+
+Japan-specific extension of GenericMapPlotter (v2 Architecture).
+
+Includes:
+    * Strict Unit Contract (metres for station corridors, points for strokes/fonts)
+    * Targeted admin_level querying (avoids downloading national level-2 borders)
+    * Hybrid Administrative + Place Node fallback system:
+      Automatically renders 'place=quarter/neighbourhood/suburb/hamlet' point nodes
+      when non-major cities lack level 8/9 administrative polygons.
+    * Automatic deduplication between polygon centroids and point nodes.
+"""
+
+from __future__ import annotations
+
 import logging
-import osmnx as ox
-import matplotlib.pyplot as plt
-import matplotlib.patheffects as pe
 import math
 import random
-import pandas as pd
 import re
-import geopandas as gpd
-from shapely.geometry import Polygon, MultiPolygon, box
-from shapely.ops import unary_union
-from pyproj import Transformer
-from generic_plotter import GenericMapPlotter, logger, decorate_map_layout
 
-# Recommended fonts order: Noto Sans JP -> Hiragino Sans -> Meiryo
-plt.rcParams['font.sans-serif'] = ['Noto Sans JP', 'Hiragino Sans', 'Meiryo', 'Source Han Sans JP', 'sans-serif']
-# ==========================================
-# JapanMapPlotter: Cultural & Human Geography
-# ==========================================
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import pandas as pd
+from shapely.geometry import MultiPolygon
+from shapely.ops import unary_union
+
+from generic_plotter import (
+    GenericMapPlotter,
+    decorate_map_layout,
+)
+from map_styles import JapanMapStyle
+
+
+logger = logging.getLogger("GenericPlotter")
+
+
+plt.rcParams["font.sans-serif"] = [
+    "Noto Sans JP",
+    "Hiragino Sans",
+    "Meiryo",
+    "Source Han Sans JP",
+    "sans-serif",
+]
+plt.rcParams["axes.unicode_minus"] = False
+
+
+# Priority order when rendering fallback place nodes (larger settlements first)
+_PLACE_HIERARCHY = {
+    "town": 1,
+    "suburb": 2,
+    "borough": 2,
+    "village": 3,
+    "quarter": 4,
+    "neighbourhood": 5,
+    "hamlet": 6,
+    "isolated_dwelling": 7,
+}
+
+# Equivalent admin_level mapping so place nodes inherit harmonious font sizes
+_PLACE_TO_ADMIN_LEVEL = {
+    "town": 7,
+    "suburb": 7,
+    "borough": 7,
+    "village": 8,
+    "quarter": 8,
+    "neighbourhood": 9,
+    "hamlet": 9,
+    "isolated_dwelling": 9,
+}
+
+
 class JapanMapPlotter(GenericMapPlotter):
     """
-    承繼 GenericMapPlotter，專門處理日本高度發達的人文地理、多層級行政區劃 (町丁/丁目)、
-    軌道交通網路 (黑白/黑綠相間)、複雜車站複合體、交流道及日文雙語標籤系統。
+    Japan-specific map plotter.
+    Inherits the generic geographic and infrastructure engine and adds
+    Japanese human-geography layers with rural/suburban point-node fallbacks.
     """
-    def __init__(self, bbox=None, center_point=None, dist=5000, 
-                 custom_linewidths=None, custom_colors=None, 
-                 bg_color="#d1e2f8", land_color="#f8fafc", 
-                 admin_widths=(0, 0, 0, 0, 0, 0, 2.5, 0, 0.5, 0), 
-                 projection="wgs84"):
-        
-        super().__init__(bbox, center_point, dist, custom_linewidths, custom_colors, bg_color, land_color, projection)
-        
-        if len(admin_widths) != 10:
-            raise ValueError("admin_widths must be a tuple of length 10")
-        self.admin_widths = admin_widths
-        
-        self.gdf_admins = {} 
-        self.gdf_railways = None
-        self.gdf_exits = None
-        self.gdf_stations = None
-        self.gdf_piers = None
+
+    def __init__(
+        self,
+        bbox=None,
+        center_point=None,
+        dist=5000,
+        custom_linewidths=None,
+        custom_colors=None,
+        bg_color=None,
+        land_color=None,
+        admin_widths=None,
+        projection="wgs84",
+        style: JapanMapStyle | None = None,
+        cache=None,
+        cache_enabled=True,
+        cache_dir=None,
+        cache_ttl_days=30,
+        clip_features=True,
+        clip_buffer_ratio=0.05,
+    ):
+        logger.info("Initializing JapanMapPlotter...")
+
+        style = style or JapanMapStyle()
+
+        if admin_widths is not None:
+            style.japan_admin.boundary_widths_pt = tuple(admin_widths)
+
+        if len(style.japan_admin.boundary_widths_pt) != 10:
+            raise ValueError(
+                "boundary_widths_pt must contain exactly 10 admin levels."
+            )
+
+        super().__init__(
+            bbox=bbox,
+            center_point=center_point,
+            dist=dist,
+            custom_linewidths=custom_linewidths,
+            custom_colors=custom_colors,
+            bg_color=bg_color,
+            land_color=land_color,
+            projection=projection,
+            style=style,
+            cache=cache,
+            cache_enabled=cache_enabled,
+            cache_dir=cache_dir,
+            cache_ttl_days=cache_ttl_days,
+            clip_features=clip_features,
+            clip_buffer_ratio=clip_buffer_ratio,
+        )
+
+        self.admin_widths = style.japan_admin.boundary_widths_pt
+
+        self.gdf_admins: dict[int, gpd.GeoDataFrame] = {}
+        self.gdf_local_places: gpd.GeoDataFrame | None = None
+        self.gdf_railways: gpd.GeoDataFrame | None = None
+        self.gdf_exits: gpd.GeoDataFrame | None = None
+        self.gdf_stations: gpd.GeoDataFrame | None = None
+        self.gdf_piers: gpd.GeoDataFrame | None = None
+
         self._admins_fetched = False
-        
+        self._places_fetched = False
+
+    # ------------------------------------------------------------------
+    # Administrative boundaries & Local Place Nodes (Hybrid System)
+    # ------------------------------------------------------------------
+
     def _fetch_and_categorize_admins(self):
-        if self._admins_fetched: return
-            
-        logger.info("Batch fetching ALL Japanese administrative boundaries...")
-        try:
-            tags = {'boundary': 'administrative'}
-            raw_gdf = ox.features_from_bbox(bbox=self.bbox, tags=tags) if self.bbox else ox.features_from_point(self.center_point, tags=tags, dist=self.dist)
-                
-            gdf_proj = self._project(raw_gdf)
-            gdf_poly = gdf_proj[gdf_proj.geometry.type.isin(['Polygon', 'MultiPolygon'])].copy()
-            
-            if 'admin_level' in gdf_poly.columns:
-                gdf_poly['admin_level_clean'] = gdf_poly['admin_level'].apply(
-                    lambda x: str(x[0]) if isinstance(x, list) else str(x)
+        """
+        Fetch Japanese administrative boundaries once and categorize by admin_level.
+        Explicitly queries levels 4..10 to avoid downloading giant national (level 2)
+        polygons.
+        """
+        if self._admins_fetched:
+            return
+
+        logger.info(
+            "Fetching and categorizing Japanese administrative boundaries..."
+        )
+
+        tags = {
+            "boundary": "administrative",
+            "admin_level": ["4", "5", "6", "7", "8", "9", "10"],
+        }
+
+        raw_gdf = self._fetch_features(
+            tags,
+            layer_name="jp_admin_boundaries",
+        )
+
+        if raw_gdf is not None and not raw_gdf.empty:
+            gdf_poly = raw_gdf[
+                raw_gdf.geometry.type.isin(["Polygon", "MultiPolygon"])
+            ].copy()
+
+            if "admin_level" in gdf_poly.columns:
+                gdf_poly["admin_level_clean"] = gdf_poly["admin_level"].apply(
+                    lambda value: (
+                        str(value[0]) if isinstance(value, list) else str(value)
+                    )
                 )
-                for lvl_str, group in gdf_poly.groupby('admin_level_clean'):
-                    if lvl_str.replace('.', '', 1).isdigit() and lvl_str != 'nan':
-                        self.gdf_admins[int(float(lvl_str))] = group
-                        
-            self._admins_fetched = True
-        except Exception as e:
-            logger.warning(f"Failed to fetch administrative boundaries: {e}")
-            self._admins_fetched = True
+
+                for level_string, group in gdf_poly.groupby(
+                    "admin_level_clean"
+                ):
+                    if (
+                        level_string.replace(".", "", 1).isdigit()
+                        and level_string != "nan"
+                    ):
+                        level = int(float(level_string))
+                        self.gdf_admins[level] = group
+                        logger.debug(
+                            "Admin level %d: %d polygon boundaries.",
+                            level,
+                            len(group),
+                        )
+
+        self._admins_fetched = True
+
+    def _fetch_local_places(self):
+        """
+        Fetch point/polygon settlement features (neighbourhood, quarter, Oaza,
+        suburb, hamlet, village). Crucial for non-major Japanese cities where
+        Chome/Machicho are mapped as nodes rather than administrative polygons.
+        """
+        if self._places_fetched:
+            return
+
+        logger.info(
+            "Fetching local place nodes (neighbourhood/quarter/suburb fallback)..."
+        )
+
+        tags = {
+            "place": list(_PLACE_HIERARCHY.keys()),
+        }
+
+        raw_places = self._fetch_features(
+            tags,
+            layer_name="jp_local_places",
+        )
+
+        if raw_places is not None and not raw_places.empty:
+            df = raw_places.copy()
+            if "place" in df.columns:
+                df["place_clean"] = df["place"].apply(
+                    lambda v: str(v[0]) if isinstance(v, list) else str(v)
+                )
+                df = df[df["place_clean"].isin(_PLACE_HIERARCHY.keys())].copy()
+                df["place_rank"] = df["place_clean"].map(_PLACE_HIERARCHY).fillna(99)
+                df.sort_values("place_rank", inplace=True)
+                self.gdf_local_places = df
+            else:
+                self.gdf_local_places = gpd.GeoDataFrame(
+                    geometry=[], crs=self.crs
+                )
+        else:
+            self.gdf_local_places = gpd.GeoDataFrame(
+                geometry=[], crs=self.crs
+            )
+
+        self._places_fetched = True
 
     def draw_admins(self):
         """
-        繪製日本行政區邊界與多層次底色。
-        利用 Z-order 將填色層放在水域之下，完美解決町丁延伸到海裡的問題。
+        Draw Japanese administrative boundaries.
+        Fills are placed at zorder 0.15 (underneath water at 0.20) so coastal
+        zones never bleed into the ocean.
         """
         self._fetch_and_categorize_admins()
-        for i, width in enumerate(self.admin_widths):
-            level = i + 1 
-            if width <= 0: continue
-            
+
+        style = self.style.japan_admin
+
+        for index, width_pt in enumerate(style.boundary_widths_pt):
+            level = index + 1
+            if width_pt <= 0:
+                continue
+
             gdf = self.gdf_admins.get(level)
-            if gdf is None or gdf.empty: continue
-            
-            if level in [7, 8, 9]:
+            if gdf is None or gdf.empty:
+                continue
+
+            if level in {7, 8, 9}:
                 color_ids = list(range(len(gdf)))
-                random.seed(42 + level); random.shuffle(color_ids)
-                gdf = gdf.copy()
-                gdf['color_id'] = color_ids
-                
-                alpha_val = {7: 0.05, 8: 0.2, 9: 0.4}.get(level, 0.1)
-                
-                # 🌟 關鍵修正：zorder=0.15，這樣會被 zorder=0.20 的水域蓋住！
-                gdf.plot(ax=self.ax, column='color_id', cmap='Pastel2', alpha=alpha_val, edgecolor='none', zorder=0.15 + (level * 0.001))
-            
-            gdf.plot(ax=self.ax, facecolor='none', edgecolor="#94a3b8", linewidth=width, linestyle='-.', alpha=0.8, zorder=0.201 + (level * 0.001))
-            
+                random.seed(42 + level)
+                random.shuffle(color_ids)
+
+                gdf_fill = gdf.copy()
+                gdf_fill["color_id"] = color_ids
+
+                alpha_val = style.fill_alpha.get(level, 0.1)
+
+                gdf_fill.plot(
+                    ax=self.ax,
+                    column="color_id",
+                    cmap=style.fill_colormap,
+                    alpha=alpha_val,
+                    edgecolor="none",
+                    zorder=0.15 + level * 0.001,
+                )
+
+            gdf.plot(
+                ax=self.ax,
+                facecolor="none",
+                edgecolor=style.boundary_color,
+                linewidth=self._get_stroke_width(width_pt),
+                linestyle=style.boundary_linestyle,
+                alpha=style.boundary_alpha,
+                zorder=0.201 + level * 0.001,
+            )
+
         return self
 
-    def draw_admin_labels(self, levels=(4, 6, 7, 8, 9), min_distance_ratio=0.015):
-        """
-        繪製各級行政區地名。
-        移除陰影，使用單一文字物件進行雙行排版，徹底解決距離衝突。
-        """
-        import pandas as pd
-        from shapely.geometry import MultiPolygon
-        import re
+    # ------------------------------------------------------------------
+    # Bilingual Label Formatting Helper
+    # ------------------------------------------------------------------
 
-        if self.ax is None: raise ValueError("Canvas not found.")
+    def _extract_bilingual_names(
+        self, row: pd.Series, uppercase_secondary: bool = False
+    ) -> tuple[str, str]:
+        """Extract and format primary (Kanji) and secondary (Romaji/English) names."""
+        primary_name = str(
+            row.get("name") or row.get("name:ja") or ""
+        ).strip()
+
+        if (
+            not primary_name
+            or primary_name.lower() in {"none", "nan"}
+            or "所属未定地" in primary_name
+        ):
+            return "", ""
+
+        secondary_name = ""
+        for tag in ["name:ja_rm", "name:ja-Latn", "name:ja:Latn", "name:en"]:
+            value = row.get(tag)
+            if pd.notna(value) and str(value).strip().lower() not in {
+                "",
+                "nan",
+                "none",
+            }:
+                secondary_name = str(value).strip()
+                break
+
+        if secondary_name and uppercase_secondary:
+            secondary_name = secondary_name.upper()
+
+        if (
+            " " in secondary_name or "-" in secondary_name
+        ) and len(secondary_name) >= 14:
+            parts = re.split(r"[-\s]", secondary_name)
+            if parts and parts[0]:
+                secondary_name = (
+                    parts[0][0].upper() + ".-" + "-".join(parts[1:])
+                )
+
+        return primary_name, secondary_name
+
+    def _render_bilingual_label(
+        self,
+        x: float,
+        y: float,
+        primary_name: str,
+        secondary_name: str,
+        primary_fontsize: float,
+        secondary_fontsize: float,
+        text_color: str,
+        y_offset: float,
+        alpha_primary: float = 0.85,
+        alpha_secondary: float = 0.70,
+        zorder: float = 6.0,
+    ):
+        """Render a clean, shadow-less two-line Kanji + Romaji label."""
+        display_pri = (
+            " ".join(primary_name)
+            if len(primary_name) < 4
+            else primary_name
+        )
+
+        if secondary_name:
+            self.ax.text(
+                x,
+                y + y_offset,
+                display_pri,
+                color=text_color,
+                fontsize=primary_fontsize,
+                ha="center",
+                va="bottom",
+                zorder=zorder,
+                clip_on=True,
+                fontweight="bold",
+                alpha=alpha_primary,
+            )
+            self.ax.text(
+                x,
+                y - y_offset,
+                secondary_name,
+                color=text_color,
+                fontsize=secondary_fontsize,
+                ha="center",
+                va="top",
+                zorder=zorder,
+                clip_on=True,
+                fontweight="normal",
+                alpha=alpha_secondary,
+            )
+        else:
+            self.ax.text(
+                x,
+                y,
+                display_pri,
+                color=text_color,
+                fontsize=primary_fontsize,
+                ha="center",
+                va="center",
+                zorder=zorder,
+                clip_on=True,
+                fontweight="bold",
+                alpha=alpha_primary,
+            )
+
+    def draw_admin_labels(
+        self,
+        levels=(4, 6, 7, 8, 9),
+        min_distance_ratio=0.015,
+        include_place_nodes: bool = True,
+    ):
+        """
+        Draw bilingual Japanese administrative labels.
+
+        Hybrid Strategy
+        ---------------
+        1. Renders polygon-based administrative labels for requested ``levels``.
+        2. If ``include_place_nodes=True``, automatically supplements the map
+           with point/polygon ``place=quarter/neighbourhood/suburb/hamlet``
+           features that were not already represented by administrative polygons.
+           This prevents rural or suburban maps from looking empty.
+        """
+        if self.ax is None:
+            raise ValueError("Canvas not found.")
+
         self._fetch_and_categorize_admins()
-        
-        target_levels = [levels] if isinstance(levels, int) else (levels if levels else [4, 6, 7, 8, 9])
-        scale_factor = self.fig.get_figwidth() / 48.0
-        
-        font_size_map = {4: int(72 * scale_factor), 6: int(55 * scale_factor), 7: int(35 * scale_factor), 8: int(27 * scale_factor), 9: int(12 * scale_factor)}
-        placed_labels = []
-        min_dist = (self.maxx - self.minx) * min_distance_ratio 
 
+        style = self.style.japan_admin
+        target_levels = (
+            [levels]
+            if isinstance(levels, int)
+            else (list(levels) if levels else [4, 6, 7, 8, 9])
+        )
+
+        placed_labels: list[tuple[float, float]] = []
+        placed_names: set[str] = set()
+
+        min_dist = (self.maxx - self.minx) * min_distance_ratio
+        y_offset = (self.maxy - self.miny) * style.label_y_offset_ratio
+
+        # --------------------------------------------------------------
+        # Pass 1: Polygon-based Administrative Boundaries
+        # --------------------------------------------------------------
         for level in sorted(target_levels):
             gdf = self.gdf_admins.get(level)
-            if gdf is None or gdf.empty: continue
-                
-            pri_fontsize = font_size_map.get(level, int(8 * scale_factor))
-            # 羅馬拼音稍微縮小
-            sec_fontsize = max(int(4 * scale_factor), int(pri_fontsize * 0.65))
+            if gdf is None or gdf.empty:
+                continue
 
-            for idx, row in gdf.iterrows():
+            primary_fontsize = style.label_font_sizes_pt.get(level, 10.0)
+            secondary_fontsize = max(
+                6.0, primary_fontsize * style.label_secondary_ratio
+            )
+
+            for _, row in gdf.iterrows():
                 geom = row.geometry
-                if geom is None or geom.is_empty: continue
-                
-                pri_name = str(row.get('name') or row.get('name:ja')).strip()
-                if not pri_name or pri_name == 'None' or "所属未定地" in pri_name: continue
+                if geom is None or geom.is_empty:
+                    continue
 
-                sec_name = ""
-                for tag in ['name:ja_rm', 'name:en']:
-                    val = row.get(tag)
-                    if pd.notna(val) and str(val).strip().lower() not in ['', 'nan', 'none']:
-                        sec_name = str(val).strip(); break 
-                        
-                if sec_name and level == 9: sec_name = sec_name.upper()
-                if isinstance(geom, MultiPolygon): geom = max(geom.geoms, key=lambda p: p.area)
-                
-                # 確保中心點落在陸地上 (避免海上標籤)
-                center_pt = geom.centroid if geom.contains(geom.centroid) else geom.representative_point()
+                raw_pri, sec_name = self._extract_bilingual_names(
+                    row, uppercase_secondary=(level == 9)
+                )
+                if not raw_pri:
+                    continue
+
+                if isinstance(geom, MultiPolygon):
+                    geom = max(geom.geoms, key=lambda polygon: polygon.area)
+
+                center_pt = (
+                    geom.centroid
+                    if geom.contains(geom.centroid)
+                    else geom.representative_point()
+                )
                 x, y = center_pt.x, center_pt.y
 
-                if not (self.minx <= x <= self.maxx and self.miny <= y <= self.maxy): continue
-                if any(math.hypot(x - px, y - py) < min_dist for px, py in placed_labels): continue 
+                if not (
+                    self.minx <= x <= self.maxx
+                    and self.miny <= y <= self.maxy
+                ):
+                    continue
+
+                if any(
+                    math.hypot(x - px, y - py) < min_dist
+                    for px, py in placed_labels
+                ):
+                    continue
+
                 placed_labels.append((x, y))
+                placed_names.add(raw_pri)
 
-                if (" " in sec_name or "-" in sec_name) and len(sec_name) >= 14:
-                    _splited = re.split(r"[-\s]", sec_name)
-                    sec_name = (_splited[0][0].upper() + ".-") + "-".join(_splited[1:])
-                if len(pri_name) < 4: pri_name = " ".join(pri_name)
+                self._render_bilingual_label(
+                    x=x,
+                    y=y,
+                    primary_name=raw_pri,
+                    secondary_name=sec_name,
+                    primary_fontsize=primary_fontsize,
+                    secondary_fontsize=secondary_fontsize,
+                    text_color=style.label_color,
+                    y_offset=y_offset,
+                )
 
-                # 🌟 關鍵修正：不用陰影，改用沉穩的文字顏色，並用 \n 合併
-                # 設定顏色 (如果你的地圖底色是淺色，這裡用深鐵灰色 #334155 會非常有質感)
-                text_color = "#334155" 
-                
-                if sec_name:
-                    # 使用富文本或多行方式 (Matplotlib 同一 text 只能有一個 fontsize，所以我們用兩次 text，但錨點對齊)
-                    # 為了精準控制，依然拆分兩行，但這次用絕對相對位移
-                    y_offset = (self.maxx - self.minx) * 0.0005 * scale_factor
-                    
-                    self.ax.text(x, y + y_offset, pri_name, color=text_color, fontsize=pri_fontsize, ha='center', va='bottom', zorder=6.0, clip_on=True, fontweight='bold', alpha=0.85)
-                    self.ax.text(x, y - y_offset, sec_name, color=text_color, fontsize=sec_fontsize, ha='center', va='top', zorder=6.0, clip_on=True, fontweight='normal', alpha=0.7)
-                else:
-                    self.ax.text(x, y, pri_name, color=text_color, fontsize=pri_fontsize, ha='center', va='center', zorder=6.0, clip_on=True, fontweight='bold', alpha=0.85)
+        # --------------------------------------------------------------
+        # Pass 2: Point/Polygon 'place=*' Fallback for Non-Major Cities
+        # --------------------------------------------------------------
+        if include_place_nodes:
+            self._fetch_local_places()
+
+            if (
+                self.gdf_local_places is not None
+                and not self.gdf_local_places.empty
+            ):
+                custom_place_sizes = getattr(
+                    style, "place_font_sizes_pt", {}
+                )
+                fallback_count = 0
+
+                for _, row in self.gdf_local_places.iterrows():
+                    geom = row.geometry
+                    if geom is None or geom.is_empty:
+                        continue
+
+                    place_type = row.get("place_clean", "neighbourhood")
+                    equiv_level = _PLACE_TO_ADMIN_LEVEL.get(place_type, 9)
+
+                    # Only draw place types whose equivalent level is requested
+                    if equiv_level not in target_levels and not (
+                        equiv_level >= 8
+                        and any(lvl >= 8 for lvl in target_levels)
+                    ):
+                        continue
+
+                    raw_pri, sec_name = self._extract_bilingual_names(
+                        row, uppercase_secondary=(equiv_level == 9)
+                    )
+                    if not raw_pri or raw_pri in placed_names:
+                        continue
+
+                    if geom.geom_type in ("Point", "MultiPoint"):
+                        pt = (
+                            geom
+                            if geom.geom_type == "Point"
+                            else geom.geoms[0]
+                        )
+                    else:
+                        pt = (
+                            geom.centroid
+                            if geom.contains(geom.centroid)
+                            else geom.representative_point()
+                        )
+
+                    x, y = pt.x, pt.y
+                    if not (
+                        self.minx <= x <= self.maxx
+                        and self.miny <= y <= self.maxy
+                    ):
+                        continue
+
+                    if any(
+                        math.hypot(x - px, y - py) < min_dist
+                        for px, py in placed_labels
+                    ):
+                        continue
+
+                    pri_fs = custom_place_sizes.get(
+                        place_type,
+                        style.label_font_sizes_pt.get(equiv_level, 9.5),
+                    )
+                    sec_fs = max(6.0, pri_fs * style.label_secondary_ratio)
+
+                    placed_labels.append((x, y))
+                    placed_names.add(raw_pri)
+                    fallback_count += 1
+
+                    self._render_bilingual_label(
+                        x=x,
+                        y=y,
+                        primary_name=raw_pri,
+                        secondary_name=sec_name,
+                        primary_fontsize=pri_fs,
+                        secondary_fontsize=sec_fs,
+                        text_color=style.label_color,
+                        y_offset=y_offset,
+                        alpha_primary=0.80,
+                        alpha_secondary=0.65,
+                        zorder=5.9,
+                    )
+
+                logger.info(
+                    "Supplemented map with %d local place-node labels.",
+                    fallback_count,
+                )
 
         return self
-    
+
+    # ------------------------------------------------------------------
+    # Railways
+    # ------------------------------------------------------------------
+
+    def _fetch_railways(self):
+        """Fetch and normalize Japanese railway geometries."""
+        if self.gdf_railways is not None:
+            return
+
+        tags = {
+            "railway": [
+                "rail",
+                "subway",
+                "light_rail",
+                "tram",
+                "narrow_gauge",
+                "monorail",
+                "funicular",
+            ]
+        }
+
+        raw_rail = self._fetch_features(tags, layer_name="jp_railways")
+
+        if raw_rail is None or raw_rail.empty:
+            self.gdf_railways = gpd.GeoDataFrame(geometry=[], crs=self.crs)
+            return
+
+        self.gdf_railways = raw_rail[
+            raw_rail.geometry.type.isin(["LineString", "MultiLineString"])
+        ].copy()
+
     def draw_railways(self):
-        if getattr(self, 'gdf_railways', None) is None:
-            try:
-                tags = {'railway': ['rail', 'subway', 'light_rail', 'tram', 'narrow_gauge', 'monorail', 'funicular']}
-                raw_rail = ox.features_from_bbox(bbox=self.bbox, tags=tags) if self.bbox else ox.features_from_point(self.center_point, tags=tags, dist=self.dist)
-                gdf_r = self._project(raw_rail)
-                self.gdf_railways = gdf_r[gdf_r.geometry.type.isin(['LineString', 'MultiLineString'])].copy()
-            except Exception:
-                self.gdf_railways = None
+        """Draw Japan's complex railway network (stroke widths in POINTS)."""
+        self._fetch_railways()
 
-        if self.gdf_railways is None or self.gdf_railways.empty: return self
-        color_col = 'colour' if 'colour' in self.gdf_railways.columns else ('color' if 'color' in self.gdf_railways.columns else None)
-        
-        def get_valid_color(c):
-            if pd.isna(c) or str(c).strip().lower() == 'nan' or not str(c).strip(): return None
-            return str(c).strip().lower().split(';')[0]
+        if self.gdf_railways.empty:
+            return self
 
-        self.gdf_railways['parsed_color'] = self.gdf_railways[color_col].apply(get_valid_color) if color_col else None
-        high_cap_gdf, other_rail_gdf = self.gdf_railways[self.gdf_railways['railway'].isin(['rail', 'narrow_gauge'])], self.gdf_railways[~self.gdf_railways['railway'].isin(['rail', 'narrow_gauge'])]
-        base_lw, dash_lw = 2.5 * (self.fig.get_figwidth() / 72.0), 1.2 * (self.fig.get_figwidth() / 72.0)
+        style = self.style.japan_railways
 
-        if not other_rail_gdf.empty:
-            other_rail_gdf['render_color'] = other_rail_gdf['parsed_color'].fillna('#555555')
-            for color, group in other_rail_gdf.groupby('render_color'): group.plot(ax=self.ax, color=color, linewidth=base_lw * 0.7, zorder=3.5, alpha=0.9)
-        if not high_cap_gdf.empty:
-            high_cap_gdf.plot(ax=self.ax, color='#18181b', linewidth=base_lw, zorder=3.6)
-            for color, group in high_cap_gdf.assign(dash_color=high_cap_gdf['parsed_color'].fillna('#ffffff')).groupby('dash_color'):
-                group.plot(ax=self.ax, color=color, linewidth=dash_lw, linestyle=(0, (4, 4)), zorder=3.7)
+        color_col = (
+            "colour"
+            if "colour" in self.gdf_railways.columns
+            else ("color" if "color" in self.gdf_railways.columns else None)
+        )
+
+        def get_valid_color(value):
+            if pd.isna(value) or str(value).strip().lower() in ["", "nan"]:
+                return None
+            return str(value).strip().lower().split(";")[0]
+
+        self.gdf_railways["parsed_color"] = (
+            self.gdf_railways[color_col].apply(get_valid_color)
+            if color_col
+            else None
+        )
+
+        high_capacity = self.gdf_railways[
+            self.gdf_railways["railway"].isin(["rail", "narrow_gauge"])
+        ]
+        other_rail = self.gdf_railways[
+            ~self.gdf_railways["railway"].isin(["rail", "narrow_gauge"])
+        ]
+
+        if not other_rail.empty:
+            other_rail = other_rail.copy()
+            other_rail["render_color"] = other_rail["parsed_color"].fillna(
+                style.default_color
+            )
+
+            for color, group in other_rail.groupby("render_color"):
+                group.plot(
+                    ax=self.ax,
+                    color=color,
+                    linewidth=self._get_stroke_width(style.urban_width_pt),
+                    zorder=style.urban_zorder,
+                    alpha=style.alpha,
+                )
+
+        if not high_capacity.empty:
+            high_capacity.plot(
+                ax=self.ax,
+                color=style.heavy_base_color,
+                linewidth=self._get_stroke_width(style.heavy_width_pt),
+                zorder=style.heavy_zorder,
+            )
+
+            dash_df = high_capacity.copy()
+            dash_df["dash_color"] = dash_df["parsed_color"].fillna(
+                style.heavy_dash_color
+            )
+
+            for color, group in dash_df.groupby("dash_color"):
+                group.plot(
+                    ax=self.ax,
+                    color=color,
+                    linewidth=self._get_stroke_width(style.heavy_dash_width_pt),
+                    linestyle=(0, style.dash_pattern),
+                    zorder=style.heavy_dash_zorder,
+                )
+
         return self
-    
-    def draw_stations(self, min_distance_ratio=0.010):
-        if getattr(self, 'gdf_stations', None) is None:
-            try:
-                tags = {'public_transport': 'stop_area', 'building': 'train_station', 'railway': ['station', 'platform']}
-                gdf_proj = self._project(ox.features_from_bbox(bbox=self.bbox, tags=tags) if self.bbox else ox.features_from_point(self.center_point, tags=tags, dist=self.dist))
-                is_bus = pd.Series(False, index=gdf_proj.index)
-                for col in ['highway', 'amenity']:
-                    if col in gdf_proj.columns: is_bus = is_bus | gdf_proj[col].isin(['bus_station', 'bus_stop'])
-                self.gdf_stations = gdf_proj[~is_bus].copy()
-            except Exception:
-                self.gdf_stations = None
 
-        if self.gdf_stations is not None and not self.gdf_stations.empty:
-            scale_factor, render_geoms = self.fig.get_figwidth() / 72.0, []
-            for _, row in self.gdf_stations.iterrows():
-                geom = row.geometry
-                if geom.is_empty or geom.geom_type in ['Point', 'MultiPoint']: continue
-                render_geoms.append(geom.buffer(3.0) if geom.geom_type in ['LineString', 'MultiLineString'] else geom)
+    # ------------------------------------------------------------------
+    # Stations
+    # ------------------------------------------------------------------
 
-            if render_geoms:
-                gpd.GeoDataFrame(geometry=[unary_union(render_geoms)], crs=self.gdf_stations.crs).plot(ax=self.ax, facecolor='#f4f4f5', edgecolor='#52525b', linewidth=1.5 * scale_factor, zorder=3.8)
+    def _fetch_stations(self):
+        """Fetch and filter Japanese station infrastructure (excluding bus stops)."""
+        if self.gdf_stations is not None:
+            return
 
-            station_groups, placed_stations, min_dist = {}, [], (self.maxx - self.minx) * min_distance_ratio
-            for _, row in self.gdf_stations.iterrows():
-                pri = str(row.get('name') or row.get('name:ja')).strip()
-                if not pri or pri.lower() in ['nan', 'none']: continue
-                sec = next((str(val).strip() for val in (row.get(tag) for tag in ['name:en', 'name:ja_rm', 'name:ja-Latn', 'name:ja:Latn']) if pd.notna(val) and str(val).strip().lower() not in ['', 'nan', 'none']), "")
-                if not sec: continue
-                station_groups.setdefault((pri, sec), []).append(row.geometry)
+        tags = {
+            "public_transport": "stop_area",
+            "building": "train_station",
+            "railway": ["station", "platform"],
+        }
 
-            bbox_style = dict(facecolor='#18181b', alpha=0.85, edgecolor='#facc15', linewidth=0.6 * scale_factor, boxstyle=f'square,pad={0.15 * scale_factor}')
-            for (pri, sec), geoms in station_groups.items():
-                merged = unary_union(geoms)
-                pt = merged.centroid if merged.contains(merged.centroid) else merged.representative_point()
-                if not (self.minx <= pt.x <= self.maxx and self.miny <= pt.y <= self.maxy): continue
-                if any(math.hypot(pt.x - px, pt.y - py) < min_dist for px, py in placed_stations): continue
-                placed_stations.append((pt.x, pt.y))
-                self.ax.text(pt.x, pt.y, f"{pri}\n{sec}", color="#fef08a", fontsize=max(4, int(4.5 * scale_factor)), ha='center', va='center', zorder=6.5, clip_on=True, fontfamily='sans-serif', fontweight='bold', bbox=bbox_style, linespacing=1.2)
+        gdf = self._fetch_features(tags, layer_name="jp_stations")
+
+        if gdf is None or gdf.empty:
+            self.gdf_stations = gpd.GeoDataFrame(geometry=[], crs=self.crs)
+            return
+
+        is_bus = pd.Series(False, index=gdf.index)
+        for col in ["highway", "amenity"]:
+            if col in gdf.columns:
+                is_bus = is_bus | gdf[col].isin(["bus_station", "bus_stop"])
+
+        self.gdf_stations = gdf[~is_bus].copy()
+
+    def _prepare_station_footprint(self, station_gdf):
+        """
+        Build physical station footprints in metric_crs.
+        Station corridors are buffered by physical metres (corridor_width_m / 2).
+        """
+        style = self.style.japan_stations
+        render_geoms = []
+
+        metric = self._to_metric(station_gdf)
+
+        for geom in metric.geometry:
+            if geom is None or geom.is_empty:
+                continue
+
+            if geom.geom_type in ("Point", "MultiPoint"):
+                continue
+
+            if geom.geom_type in ("LineString", "MultiLineString"):
+                geom = geom.buffer(style.corridor_width_m / 2.0)
+
+            render_geoms.append(geom)
+
+        if not render_geoms:
+            return None
+
+        merged = unary_union(render_geoms)
+
+        return gpd.GeoDataFrame(
+            geometry=[merged],
+            crs=self.metric_crs,
+        ).to_crs(self.crs)
+
+    def draw_stations(self, min_distance_ratio=None):
+        """Draw Japanese station complexes and bilingual signboards."""
+        self._fetch_stations()
+
+        if self.gdf_stations.empty:
+            return self
+
+        style = self.style.japan_stations
+
+        min_distance_ratio = (
+            style.label_collision_ratio
+            if min_distance_ratio is None
+            else min_distance_ratio
+        )
+
+        footprint = self._prepare_station_footprint(self.gdf_stations)
+
+        if footprint is not None:
+            footprint.plot(
+                ax=self.ax,
+                facecolor=style.footprint_facecolor,
+                edgecolor=style.footprint_edgecolor,
+                linewidth=style.footprint_linewidth_pt,
+                zorder=style.footprint_zorder,
+            )
+
+        station_groups = {}
+
+        for _, row in self.gdf_stations.iterrows():
+            primary = str(
+                row.get("name") or row.get("name:ja") or ""
+            ).strip()
+
+            if not primary or primary.lower() in ["nan", "none"]:
+                continue
+
+            secondary = next(
+                (
+                    str(value).strip()
+                    for value in (
+                        row.get(tag)
+                        for tag in [
+                            "name:en",
+                            "name:ja_rm",
+                            "name:ja-Latn",
+                            "name:ja:Latn",
+                        ]
+                    )
+                    if pd.notna(value)
+                    and str(value).strip().lower() not in ["", "nan", "none"]
+                ),
+                "",
+            )
+
+            if not secondary:
+                continue
+
+            station_groups.setdefault((primary, secondary), []).append(
+                row.geometry
+            )
+
+        placed_stations = []
+        min_dist = (self.maxx - self.minx) * min_distance_ratio
+
+        bbox_style = dict(
+            facecolor=style.label_facecolor,
+            alpha=style.label_alpha,
+            edgecolor=style.label_edgecolor,
+            linewidth=style.label_linewidth_pt,
+            boxstyle=f"square,pad={style.label_pad}",
+        )
+
+        for (primary, secondary), geometries in station_groups.items():
+            merged = unary_union(geometries)
+            pt = (
+                merged.centroid
+                if merged.contains(merged.centroid)
+                else merged.representative_point()
+            )
+
+            if not (
+                self.minx <= pt.x <= self.maxx
+                and self.miny <= pt.y <= self.maxy
+            ):
+                continue
+
+            if any(
+                math.hypot(pt.x - px, pt.y - py) < min_dist
+                for px, py in placed_stations
+            ):
+                continue
+
+            placed_stations.append((pt.x, pt.y))
+
+            self.ax.text(
+                pt.x,
+                pt.y,
+                f"{primary}\n{secondary}",
+                color=style.label_color,
+                fontsize=style.label_font_size_pt,
+                ha="center",
+                va="center",
+                zorder=style.label_zorder,
+                clip_on=True,
+                fontfamily="sans-serif",
+                fontweight="bold",
+                bbox=bbox_style,
+                linespacing=1.2,
+            )
+
         return self
 
-    def draw_highway_refs(self, min_distance_ratio=0.03):
-        if self.gdf_edges is None or self.gdf_edges.empty: return self
-        scale_factor, placed_refs, min_dist = self.fig.get_figwidth() / 72.0, [], (self.maxx - self.minx) * min_distance_ratio
+    # ------------------------------------------------------------------
+    # Highway references, Exits & Piers
+    # ------------------------------------------------------------------
+
+    def draw_highway_refs(self, min_distance_ratio=None):
+        """Draw Japanese highway reference boxes."""
+        if self.gdf_edges is None or self.gdf_edges.empty:
+            return self
+
+        style = self.style.japan_labels
+
+        min_distance_ratio = (
+            style.highway_collision_ratio
+            if min_distance_ratio is None
+            else min_distance_ratio
+        )
+
+        placed_refs = []
+        min_dist = (self.maxx - self.minx) * min_distance_ratio
+
+        bbox_style = dict(
+            facecolor=style.highway_facecolor,
+            alpha=0.85,
+            edgecolor=style.highway_edgecolor,
+            linewidth=style.highway_linewidth_pt,
+            boxstyle="square,pad=0.25",
+        )
+
         for _, row in self.gdf_edges.iterrows():
-            ref = str(row.get('ref')).strip()
-            if ref.lower() == 'nan' or not ref or row.get('highway') not in ['motorway', 'motorway_link', 'trunk', 'trunk_link']: continue
+            ref = str(row.get("ref")).strip()
+            highway = row.get("highway")
+            if isinstance(highway, list):
+                highway = highway[0]
+
+            if (
+                ref.lower() == "nan"
+                or not ref
+                or highway
+                not in ["motorway", "motorway_link", "trunk", "trunk_link"]
+            ):
+                continue
+
             geom = row.geometry
-            if geom.is_empty or geom.length < (self.maxx - self.minx) * 0.01: continue
+            if (
+                geom is None
+                or geom.is_empty
+                or geom.length < (self.maxx - self.minx) * 0.01
+            ):
+                continue
+
             pt = geom.interpolate(0.5, normalized=True)
-            if not (self.minx <= pt.x <= self.maxx and self.miny <= pt.y <= self.maxy) or any(math.hypot(pt.x - px, pt.y - py) < min_dist for px, py in placed_refs): continue
+
+            if not (
+                self.minx <= pt.x <= self.maxx
+                and self.miny <= pt.y <= self.maxy
+            ):
+                continue
+
+            if any(
+                math.hypot(pt.x - px, pt.y - py) < min_dist
+                for px, py in placed_refs
+            ):
+                continue
+
             placed_refs.append((pt.x, pt.y))
-            self.ax.text(pt.x, pt.y, ref.split(';')[0], color="white", fontsize=max(6, int(12 * scale_factor)), ha='center', va='center', zorder=4.8, clip_on=True, fontfamily='sans-serif', fontweight='bold', bbox=dict(facecolor='#27272a', alpha=0.85, edgecolor='#d4d4d8', linewidth=1.0 * scale_factor, boxstyle=f'square,pad={0.25 * scale_factor}'))
+
+            self.ax.text(
+                pt.x,
+                pt.y,
+                ref.split(";")[0],
+                color="white",
+                fontsize=style.highway_font_size_pt,
+                ha="center",
+                va="center",
+                zorder=style.highway_zorder,
+                clip_on=True,
+                fontfamily="sans-serif",
+                fontweight="bold",
+                bbox=bbox_style,
+            )
+
         return self
 
-    def draw_exits(self, min_distance_ratio=0.015):
-        if getattr(self, 'gdf_exits', None) is None:
-            try:
-                self.gdf_exits = self._project(ox.features_from_bbox(bbox=self.bbox, tags={'highway': 'motorway_junction'}) if self.bbox else ox.features_from_point(self.center_point, tags={'highway': 'motorway_junction'}, dist=self.dist))
-            except Exception: self.gdf_exits = None
-        if self.gdf_exits is None or self.gdf_exits.empty: return self
-        scale_factor, placed_exits, min_dist = self.fig.get_figwidth() / 72.0, [], (self.maxx - self.minx) * min_distance_ratio
+    def draw_exits(self, min_distance_ratio=None):
+        """Draw Japanese motorway junction and exit labels."""
+        style = self.style.japan_labels
+
+        min_distance_ratio = (
+            style.exit_collision_ratio
+            if min_distance_ratio is None
+            else min_distance_ratio
+        )
+
+        if self.gdf_exits is None:
+            self.gdf_exits = self._fetch_features(
+                {"highway": "motorway_junction"},
+                layer_name="jp_exits",
+            )
+
+        if self.gdf_exits is None or self.gdf_exits.empty:
+            return self
+
+        placed_exits = []
+        min_dist = (self.maxx - self.minx) * min_distance_ratio
+
+        bbox_style = dict(
+            facecolor=style.exit_facecolor,
+            alpha=0.9,
+            edgecolor=style.exit_edgecolor,
+            linewidth=style.exit_linewidth_pt,
+            boxstyle="square,pad=0.2",
+        )
+
         for _, row in self.gdf_exits.iterrows():
             geom = row.geometry
-            if geom.is_empty: continue
-            pt = geom.centroid if geom.geom_type in ['Polygon', 'MultiPolygon'] else geom
-            if not (self.minx <= pt.x <= self.maxx and self.miny <= pt.y <= self.maxy): continue
-            name, ref = str(row.get('name', '')).strip(), str(row.get('ref', '')).strip()
-            if not (name.lower() != 'nan' and name) and not (ref.lower() != 'nan' and ref): continue
-            if any(math.hypot(pt.x - px, pt.y - py) < min_dist for px, py in placed_exits): continue
+            if geom is None or geom.is_empty:
+                continue
+
+            pt = (
+                geom.centroid
+                if geom.geom_type in ["Polygon", "MultiPolygon"]
+                else geom
+            )
+
+            if not (
+                self.minx <= pt.x <= self.maxx
+                and self.miny <= pt.y <= self.maxy
+            ):
+                continue
+
+            name = str(row.get("name", "")).strip()
+            ref = str(row.get("ref", "")).strip()
+
+            valid_name = bool(name and name.lower() != "nan")
+            valid_ref = bool(ref and ref.lower() != "nan")
+
+            if not (valid_name or valid_ref):
+                continue
+
+            if any(
+                math.hypot(pt.x - px, pt.y - py) < min_dist
+                for px, py in placed_exits
+            ):
+                continue
+
             placed_exits.append((pt.x, pt.y))
-            self.ax.text(pt.x, pt.y, f"{ref if ref.lower()!='nan' else ''} {name if name.lower()!='nan' else ''}".strip(), color="#fef08a", fontsize=max(6, int(10 * scale_factor)), ha='left', va='center', zorder=4.9, clip_on=True, fontfamily='sans-serif', fontweight='bold', bbox=dict(facecolor='#18181b', alpha=0.9, edgecolor='#facc15', linewidth=0.8 * scale_factor, boxstyle=f'square,pad={0.2 * scale_factor}'))
+
+            label_text = (
+                f"{ref if valid_ref else ''} {name if valid_name else ''}"
+            ).strip()
+
+            self.ax.text(
+                pt.x,
+                pt.y,
+                label_text,
+                color="#fef08a",
+                fontsize=style.exit_font_size_pt,
+                ha="left",
+                va="center",
+                zorder=style.exit_zorder,
+                clip_on=True,
+                fontfamily="sans-serif",
+                fontweight="bold",
+                bbox=bbox_style,
+            )
+
         return self
 
-    def draw_piers(self):
-        if getattr(self, 'gdf_piers', None) is None:
-            try:
-                self.gdf_piers = self._project(ox.features_from_bbox(bbox=self.bbox, tags={'amenity': 'ferry_terminal', 'man_made': 'pier'}) if self.bbox else ox.features_from_point(self.center_point, tags={'amenity': 'ferry_terminal', 'man_made': 'pier'}, dist=self.dist))
-            except Exception: self.gdf_piers = None
-        if self.gdf_piers is None or self.gdf_piers.empty: return self
-        placed_piers, min_dist = [], (self.maxx - self.minx) * 0.015
+    def draw_piers(self, min_distance_ratio=None):
+        """Draw minimalist anchor icons for Japanese ferry facilities."""
+        style = self.style.japan_labels
+
+        min_distance_ratio = (
+            style.pier_collision_ratio
+            if min_distance_ratio is None
+            else min_distance_ratio
+        )
+
+        if self.gdf_piers is None:
+            self.gdf_piers = self._fetch_features(
+                {"amenity": "ferry_terminal", "man_made": "pier"},
+                layer_name="jp_piers",
+            )
+
+        if self.gdf_piers is None or self.gdf_piers.empty:
+            return self
+
+        placed_piers = []
+        min_dist = (self.maxx - self.minx) * min_distance_ratio
+
         for _, row in self.gdf_piers.iterrows():
             geom = row.geometry
-            if geom.is_empty: continue
-            pt = geom.centroid if not (geom.geom_type in ['Polygon', 'MultiPolygon'] and not geom.contains(geom.centroid)) else geom.representative_point()
-            if not (self.minx <= pt.x <= self.maxx and self.miny <= pt.y <= self.maxy) or any(math.hypot(pt.x - px, pt.y - py) < min_dist for px, py in placed_piers): continue
+            if geom is None or geom.is_empty:
+                continue
+
+            if geom.geom_type in [
+                "Polygon",
+                "MultiPolygon",
+            ] and not geom.contains(geom.centroid):
+                pt = geom.representative_point()
+            else:
+                pt = geom.centroid
+
+            if not (
+                self.minx <= pt.x <= self.maxx
+                and self.miny <= pt.y <= self.maxy
+            ):
+                continue
+
+            if any(
+                math.hypot(pt.x - px, pt.y - py) < min_dist
+                for px, py in placed_piers
+            ):
+                continue
+
             placed_piers.append((pt.x, pt.y))
-            self.ax.text(pt.x, pt.y, "⚓", color="#0ea5e9", fontsize=max(8, int(15 * (self.fig.get_figwidth() / 72.0))), ha='center', va='center', zorder=6.4, clip_on=True, fontfamily='DejaVu Sans')
+
+            self.ax.text(
+                pt.x,
+                pt.y,
+                "⚓",
+                color=style.pier_color,
+                fontsize=style.pier_font_size_pt,
+                ha="center",
+                va="center",
+                zorder=style.pier_zorder,
+                clip_on=True,
+                fontfamily="DejaVu Sans",
+            )
+
         return self
 
+
 if __name__ == "__main__":
-    bbox = (139.617014, 35.543913, 139.967247, 35.773251)
-    
-    # 🌟 使用繼承後的 JapanMapPlotter 來處理東京地圖
-    plotter_utm = JapanMapPlotter(
-        bbox=bbox,
-        admin_widths=(0, 0, 0, 3.5, 0, 0, 2.5, 0, 0.5, 0),
-        projection="utm"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] [%(name)s] -> %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
-    
-    # Method Chaining
-    (plotter_utm.setup_canvas(base_width=96)
-                .draw_land()
-                .draw_greenery()
-                .draw_buildings()
-                .draw_water()
-                .draw_piers()
-                .draw_airports()
-                .draw_roads()
-                .draw_railways()
-                .draw_stations()
-                .draw_highway_refs()
-                .draw_exits()
-                .draw_scale()
-                .draw_admins()
-                .draw_grid(10, 10, linewidth=3)
-                .draw_coordinates()
-                .draw_admin_labels(levels=(4,6,7,8,9))
-                .render())
-                
-    decorate_map_layout(plotter_utm.fig, plotter_utm.ax, plotter_utm, "Tokyo Metropoliton Sub-area Map")
-    plotter_utm.fig.patch.set_facecolor("#091c15")
-    plt.savefig("tokyo_map_1.png", dpi=200, facecolor=plotter_utm.fig.get_facecolor(), edgecolor='none')
+
+    bbox = (
+        139.729346,
+        35.625408,
+        139.759318,
+        35.641213,
+    )
+
+    style = JapanMapStyle()
+    style.roads.widths_pt["motorway"] = 5.0
+    style.japan_stations.corridor_width_m = 8.0
+    style.japan_railways.heavy_width_pt = 6.0
+
+    style.roads.adaptive_widths = True
+    style.roads.reference_scale = 25_000
+    style.roads.width_scale_exponent = 0.50
+
+    plotter = JapanMapPlotter(
+        bbox=bbox,
+        style=style,
+        projection="utm",
+        cache_enabled=True,
+        cache_ttl_days=30,
+    )
+
+    (
+        plotter.setup_canvas(base_width=16)
+        .draw_land()
+        .draw_greenery()
+        .draw_buildings()
+        .draw_water()
+        .draw_piers()
+        .draw_airports()
+        .draw_roads()
+        .draw_railways()
+        .draw_stations()
+        .draw_highway_refs()
+        .draw_exits()
+        .draw_scale()
+        .draw_admins()
+        .draw_grid(10, 10, linewidth=2.0)
+        .draw_coordinates()
+        .draw_admin_labels(
+            levels=(4, 6, 7, 8, 9),
+            include_place_nodes=True,  # Automatically fills rural/suburban node labels
+        )
+        .render()
+    )
+
+    decorate_map_layout(
+        plotter.fig,
+        plotter.ax,
+        plotter,
+        "Tokyo Metropolitan Sub-area Map",
+    )
+
+    plotter.fig.patch.set_facecolor("#091c15")
+
+    logger.info("Saving map to disk...")
+    plt.savefig(
+        "tokyo_map_v2.png",
+        dpi=200,
+        facecolor=plotter.fig.get_facecolor(),
+        edgecolor="none",
+        bbox_inches="tight",
+        pad_inches=0.25,
+    )
+    logger.info("Map generation process complete!")
