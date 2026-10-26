@@ -145,8 +145,7 @@ class JapanMapPlotter(GenericMapPlotter):
     def _fetch_and_categorize_admins(self):
         """
         Fetch Japanese administrative boundaries once and categorize by admin_level.
-        Explicitly queries levels 4..10 to avoid downloading giant national (level 2)
-        polygons.
+        Explicitly filters out historical entities (e.g. ancient provinces like Shimosa).
         """
         if self._admins_fetched:
             return
@@ -166,18 +165,47 @@ class JapanMapPlotter(GenericMapPlotter):
         )
 
         if raw_gdf is not None and not raw_gdf.empty:
-            gdf_poly = raw_gdf[
+            df = raw_gdf[
                 raw_gdf.geometry.type.isin(["Polygon", "MultiPolygon"])
             ].copy()
 
-            if "admin_level" in gdf_poly.columns:
-                gdf_poly["admin_level_clean"] = gdf_poly["admin_level"].apply(
+            # --------------------------------------------------------------
+            # 🌟 FILTER 1: Drop historical boundaries (historic=* or historic:place=*)
+            # --------------------------------------------------------------
+            historic_cols = [col for col in df.columns if "historic" in col.lower()]
+            is_historic = pd.Series(False, index=df.index)
+            
+            for col in historic_cols:
+                is_historic = is_historic | df[col].notna() & (df[col].astype(str).str.lower() != "nan")
+
+            if "historic" in df.columns:
+                # If 'historic' is explicitly set to something like 'province' or 'yes'
+                is_historic = is_historic | df["historic"].notna()
+
+            # --------------------------------------------------------------
+            # 🌟 FILTER 2: Drop entities with a past 'end_date'
+            # --------------------------------------------------------------
+            if "end_date" in df.columns:
+                has_ended = df["end_date"].notna() & (df["end_date"].astype(str).str.strip() != "")
+                is_historic = is_historic | has_ended
+
+            # Keep only modern, active administrative boundaries
+            df_modern = df[~is_historic].copy()
+
+            logger.info(
+                "Filtered out %d historical boundaries (e.g., ancient provinces). Remaining modern: %d",
+                len(df) - len(df_modern),
+                len(df_modern),
+            )
+
+            if "admin_level" in df_modern.columns:
+                df_modern["admin_level_clean"] = df_modern["admin_level"].apply(
                     lambda value: (
                         str(value[0]) if isinstance(value, list) else str(value)
                     )
                 )
 
-                for level_string, group in gdf_poly.groupby(
+                for level_string, group in df_modern.groupby(
                     "admin_level_clean"
                 ):
                     if (
@@ -1090,82 +1118,3 @@ class JapanMapPlotter(GenericMapPlotter):
             )
 
         return self
-
-
-if __name__ == "__main__":
-    import osmnx as ox
-    ox.settings.overpass_url = "http://localhost:8081/api"
-    ox.settings.overpass_rate_limit = False
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] [%(name)s@%(filename)s:%(lineno)s] -> %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-    bbox = (
-        139.729346,
-        35.625408,
-        139.759318,
-        35.641213,
-    )
-
-    style = JapanMapStyle()
-    style.roads.widths_pt["motorway"] = 5.0
-    style.japan_stations.corridor_width_m = 8.0
-    style.japan_railways.heavy_width_pt = 6.0
-
-    style.roads.adaptive_widths = True
-    style.roads.reference_scale = 25_000
-    style.roads.width_scale_exponent = 0.50
-
-    plotter = JapanMapPlotter(
-        bbox=bbox,
-        style=style,
-        projection="utm",
-        cache_enabled=True,
-        cache_ttl_days=30,
-    )
-
-    (
-        plotter.setup_canvas(base_width=16)
-        .draw_land()
-        .draw_greenery()
-        .draw_buildings()
-        .draw_water()
-        .draw_piers()
-        .draw_airports()
-        .draw_roads()
-        .draw_railways()
-        .draw_stations()
-        .draw_highway_refs()
-        .draw_exits()
-        .draw_scale()
-        .draw_admins()
-        .draw_grid(10, 10, linewidth=2.0)
-        .draw_coordinates()
-        .draw_admin_labels(
-            levels=(4, 6, 7, 8, 9),
-            #include_place_nodes=True,  # Automatically fills rural/suburban node labels
-        )
-        .render()
-    )
-
-    decorate_map_layout(
-        plotter.fig,
-        plotter.ax,
-        plotter,
-        "Tokyo Metropolitan Sub-area Map",
-    )
-
-    plotter.fig.patch.set_facecolor("#091c15")
-
-    logger.info("Saving map to disk...")
-    plt.savefig(
-        "tokyo_map_v2.png",
-        dpi=200,
-        facecolor=plotter.fig.get_facecolor(),
-        edgecolor="none",
-        bbox_inches="tight",
-        pad_inches=0.25,
-    )
-    logger.info("Map generation process complete!")

@@ -137,6 +137,28 @@ class AirportStyle:
     runway_label_font_size_pt: float = 11.0
     taxiway_label_font_size_pt: float = 7.5
     label_collision_ratio: float = 0.005
+    
+@dataclass
+class LanduseStyle:
+    """Styling for OSM landuse polygons (industrial, residential, commercial, etc.)."""
+
+    colors: dict[str, str] = field(
+        default_factory=lambda: {
+            "industrial": "#cbd5e1",    # Slate grey for factories / warehouses
+            "commercial": "#fde68a",    # Muted yellow for commercial districts
+            "retail": "#fbcfe8",        # Light pink for shopping/retail
+            "residential": "#f8fafc",   # Very pale grey for residential zones
+            "construction": "#ffedd5",  # Light orange for active construction
+            "military": "#e2e8f0",      # Muted grey
+            "quarry": "#d1d5db",        # Stone grey
+            "cemetery": "#ccfbf1",      # Teal-tinted grey
+            "brownfield": "#e5e7eb",
+            "landfill": "#9ca3af",
+        }
+    )
+    default_color: str = "#e2e8f0"
+    zorder: float = 0.12          # Placed right above base land (0.10) and below greenery (0.15)
+    alpha: float = 0.75
 
 
 @dataclass
@@ -187,6 +209,7 @@ class MapStyle:
     grid: GridStyle = field(default_factory=GridStyle)
     coordinates: CoordinateStyle = field(default_factory=CoordinateStyle)
     scale: ScaleBarStyle = field(default_factory=ScaleBarStyle)
+    landuse: LanduseStyle = field(default_factory=LanduseStyle)
 
 
 # ======================================================================
