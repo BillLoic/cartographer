@@ -317,6 +317,8 @@ class GenericMapPlotter:
             ttl_days=cache_ttl_days,
             enabled=cache_enabled,
         )
+        
+        self.grid_cells = None
 
         mode_str = (
             f"BBox mode ({self.bbox})"
@@ -678,7 +680,7 @@ class GenericMapPlotter:
     def _fetch_features(self, tags, layer_name: str) -> gpd.GeoDataFrame | None:
         """
         Fetch an OSM feature layer with application-level caching,
-        download auditing, and automatic spatial clipping to canvas bounds.
+        download auditing, automatic spatial clipping, and empty-set protection.
         """
         t0 = time.perf_counter()
 
@@ -692,11 +694,14 @@ class GenericMapPlotter:
         raw = self.cache.get("features", payload)
 
         if raw is not None:
+            # 🌟 防禦：如果快取裡記錄的是空集合 (無 elements)，直接返回 None，絕不觸發 osmnx 解析
+            if isinstance(raw, gpd.GeoDataFrame) and raw.empty:
+                logger.info("[Cache] Layer '%s' is a known empty set. Skipping.", layer_name)
+                return None
+
             projected = self._project(raw.copy())
             elapsed = time.perf_counter() - t0
-            self._audit_geodataframe(
-                projected, layer_name, elapsed, source="Cache"
-            )
+            self._audit_geodataframe(projected, layer_name, elapsed, source="Cache")
             return self._clip_to_canvas(projected, layer_name=layer_name)
 
         logger.info("Fetching '%s' features from OSM...", layer_name)
@@ -708,36 +713,47 @@ class GenericMapPlotter:
                 raw = ox.features_from_point(
                     self.center_point, tags=tags, dist=self.dist
                 )
+                
+            logger.info("Crawled '%s' features from OSM...", layer_name)
+
+            # 🌟 防禦：確保拿到的是有效 GeoDataFrame，若空則主動標記
+            if raw is None or raw.empty:
+                logger.info("OSM returned an empty set for '%s'. Caching empty result.", layer_name)
+                empty_gdf = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+                self.cache.set("features", payload, empty_gdf)
+                return None
 
             self.cache.set("features", payload, raw)
 
             projected = self._project(raw.copy())
             elapsed = time.perf_counter() - t0
-            self._audit_geodataframe(
-                projected, layer_name, elapsed, source="OSM"
-            )
+            self._audit_geodataframe(projected, layer_name, elapsed, source="OSM")
             return self._clip_to_canvas(projected, layer_name=layer_name)
+        
+        except ox._errors.InsufficientResponseError:
+            return None
 
         except Exception as exc:
             err_msg = str(exc).lower()
-            
-            # 🌟 擴增良性關鍵字：把 osmnx 的 InsufficientResponseError 也當作安全查無資料
             no_data_keywords = [
                 "no data",
                 "empty",
                 "insufficient",
                 "not find",
                 "no features",
-                "no matching features" # 新增這行
+                "insufficientresponseerror"
             ]
 
             if any(keyword in err_msg for keyword in no_data_keywords):
-                logger.info("No features found for '%s' in this area. Safely ignoring.", layer_name)
+                logger.info("No features found for '%s' (Caught exception). Safely ignoring.", layer_name)
+                # 將空集合寫入快取，下次直接避開
+                try:
+                    self.cache.set("features", payload, gpd.GeoDataFrame(geometry=[], crs="EPSG:4326"))
+                except Exception:
+                    pass
                 return None
 
-            logger.error(
-                "Fatal error while fetching '%s': %s", layer_name, exc
-            )
+            logger.error("Fatal error while fetching '%s': %s", layer_name, exc)
             raise
 
     # ------------------------------------------------------------------
@@ -1393,6 +1409,45 @@ class GenericMapPlotter:
                 )
 
         return self
+    
+    def get_grid_cell_for_point(self, x: float, y: float) -> str | None:
+        """
+        Determine which grid cell (e.g., 'A3', 'C2') a given map coordinate (x, y) falls into.
+
+        Parameters
+        ----------
+        x: float
+            Map X coordinate (e.g., projected easting, UTM coordinate, or longitude).
+        y: float
+            Map Y coordinate (e.g., projected northing, UTM coordinate, or latitude).
+
+        Returns
+        -------
+        str or None
+            The grid cell label (e.g., 'B4') if the point lies within the map extent;
+            otherwise, returns None.
+
+        Example
+        -------
+        >>> cell = plotter.get_grid_cell_for_point(139.735, 35.635)
+        >>> print(f"The landmark is located in grid cell: {cell}")
+        """
+        if not hasattr(self, "grid_cells") or not self.grid_cells:
+            logger.warning(
+                "Grid cells have not been indexed yet. Call draw_grid() first."
+            )
+            return None
+
+        # Quick boundary check
+        if not (self.minx <= x <= self.maxx and self.miny <= y <= self.maxy):
+            return None
+
+        # Iterate through indexed grid cells to find containment
+        for cell_label, (minx, miny, maxx, maxy) in self.grid_cells.items():
+            if minx <= x <= maxx and miny <= y <= maxy:
+                return cell_label
+
+        return None
 
     def draw_coordinates(self):
         """Draw geographic DMS coordinate ticks along map borders."""

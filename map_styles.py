@@ -59,10 +59,10 @@ class RoadStyle:
                 "secondary": 1.5,
                 "secondary_link": 1.0,
                 "tertiary": 1.0,
-                "tertiary_link": 0.8,
-                "residential": 0.5,
-                "unclassified": 0.5,
-                "living_street": 0.5,
+                "tertiary_link": 1.0,
+                "residential": 1.0,
+                "unclassified": 1.0,
+                "living_street": 1.0,
             },
             dtype=float,
         )
@@ -169,7 +169,7 @@ class ScaleBarStyle:
 
     x_offset_ratio: float = 0.08
     y_offset_ratio: float = 0.08
-    bar_ground_length_m: float = 500.0
+    bar_ground_length_m: float = 200.0
     color: str = "#0f172a"       # Dark slate so it stands out on light backgrounds
     font_size_pt: float = 10.0
     thick_line_width_pt: float = 2.2
@@ -198,7 +198,7 @@ class JapanAdminStyle:
     """Japanese administrative boundaries (Prefecture -> Ward -> Chome)."""
 
     boundary_widths_pt: tuple[float, ...] = (
-        0.0, 0.0, 0.0, 3.5, 0.0, 0.0, 2.5, 0.0, 0.6, 0.0
+        0.0, 0.0, 0.0, 3.5, 0.0, 3, 2.5, 0.0, 0.6, 0.0
     )
     fill_alpha: dict[int, float] = field(
         default_factory=lambda: {7: 0.05, 8: 0.20, 9: 0.40}
@@ -211,11 +211,11 @@ class JapanAdminStyle:
     # Tuned for 16-inch+ high-resolution canvases
     label_font_sizes_pt: dict[int, float] = field(
         default_factory=lambda: {
-            4: 32.0,
-            6: 24.0,
-            7: 18.0,
-            8: 13.0,
-            9: 9.5,
+            4: 112,
+            6: 84,
+            7: 60,
+            8: 45,
+            9: 34,
         }
     )
     label_secondary_ratio: float = 0.65
@@ -229,7 +229,7 @@ class JapanAdminStyle:
             "borough": 14.0,
             "village": 13.0,
             "quarter": 11.5,
-            "neighbourhood": 9.5,
+            "neighbourhood": 22.0,
             "hamlet": 9.0,
             "isolated_dwelling": 8.5,
         }

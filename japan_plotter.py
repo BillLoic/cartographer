@@ -322,7 +322,7 @@ class JapanMapPlotter(GenericMapPlotter):
 
         if (
             " " in secondary_name or "-" in secondary_name
-        ) and len(secondary_name) >= 14:
+        ) and len(secondary_name) >= 18:
             parts = re.split(r"[-\s]", secondary_name)
             if parts and parts[0]:
                 secondary_name = (
@@ -488,6 +488,7 @@ class JapanMapPlotter(GenericMapPlotter):
                     text_color=style.label_color,
                     y_offset=y_offset,
                 )
+                logger.info("Rendering %s...", raw_pri)
 
         # --------------------------------------------------------------
         # Pass 2: Point/Polygon 'place=*' Fallback for Non-Major Cities
@@ -574,6 +575,7 @@ class JapanMapPlotter(GenericMapPlotter):
                         alpha_secondary=0.65,
                         zorder=5.9,
                     )
+                    #logger.info("Rendering %s...", raw_pri)
 
                 logger.info(
                     "Supplemented map with %d local place-node labels.",
@@ -903,7 +905,7 @@ class JapanMapPlotter(GenericMapPlotter):
             if (
                 geom is None
                 or geom.is_empty
-                or geom.length < (self.maxx - self.minx) * 0.01
+                or geom.length < (self.maxx - self.minx) * 0.08
             ):
                 continue
 
@@ -1091,9 +1093,12 @@ class JapanMapPlotter(GenericMapPlotter):
 
 
 if __name__ == "__main__":
+    import osmnx as ox
+    ox.settings.overpass_url = "http://localhost:8081/api"
+    ox.settings.overpass_rate_limit = False
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] [%(name)s] -> %(message)s",
+        format="%(asctime)s [%(levelname)s] [%(name)s@%(filename)s:%(lineno)s] -> %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
@@ -1140,7 +1145,7 @@ if __name__ == "__main__":
         .draw_coordinates()
         .draw_admin_labels(
             levels=(4, 6, 7, 8, 9),
-            include_place_nodes=True,  # Automatically fills rural/suburban node labels
+            #include_place_nodes=True,  # Automatically fills rural/suburban node labels
         )
         .render()
     )
