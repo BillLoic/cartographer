@@ -720,16 +720,19 @@ class GenericMapPlotter:
 
         except Exception as exc:
             err_msg = str(exc).lower()
+            
+            # 🌟 擴增良性關鍵字：把 osmnx 的 InsufficientResponseError 也當作安全查無資料
             no_data_keywords = [
                 "no data",
                 "empty",
                 "insufficient",
                 "not find",
                 "no features",
+                "no matching features" # 新增這行
             ]
 
             if any(keyword in err_msg for keyword in no_data_keywords):
-                logger.info("No features found for '%s'.", layer_name)
+                logger.info("No features found for '%s' in this area. Safely ignoring.", layer_name)
                 return None
 
             logger.error(
@@ -865,7 +868,7 @@ class GenericMapPlotter:
         self.G = self._project_graph(self.G)
 
         # 3. Bounds calculation first (so network audit knows canvas span)
-        self.gdf_nodes, _ = ox.graph_to_gdfs(self.G, edges=False)
+        self.gdf_nodes = ox.graph_to_gdfs(self.G, edges=False)
         if self.gdf_nodes.empty:
             raise ValueError("Invalid graph bounds: No road nodes found.")
         self._calculate_bounds()
