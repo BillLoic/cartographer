@@ -221,6 +221,20 @@ class JapanAdminStyle:
     label_secondary_ratio: float = 0.65
     label_color: str = "#1e293b"
     label_y_offset_ratio: float = 0.0012
+    
+    # 在 map_styles.py 的 JapanAdminStyle 內可新增這欄：
+    place_font_sizes_pt: dict[str, float] = field(
+        default_factory=lambda: {
+            "town": 16.0,
+            "suburb": 14.0,
+            "borough": 14.0,
+            "village": 13.0,
+            "quarter": 11.5,
+            "neighbourhood": 9.5,
+            "hamlet": 9.0,
+            "isolated_dwelling": 8.5,
+        }
+    )
 
 
 @dataclass
