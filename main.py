@@ -36,6 +36,7 @@ if __name__ == "__main__":
         projection="utm",
         cache_enabled=True,
         cache_ttl_days=30,
+        query_padding=0.1
     )
     
     # 1. Setup canvas first so render_context is established
@@ -80,7 +81,7 @@ if __name__ == "__main__":
 
     logger.info("Saving map to disk...")
     plt.savefig(
-        "tokyo_map_v2.png",
+        "output_maps/tokyo_map_v2.png",
         dpi=200,
         facecolor=plotter.fig.get_facecolor(),
         edgecolor="none",

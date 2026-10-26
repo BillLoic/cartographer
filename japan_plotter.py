@@ -95,6 +95,7 @@ class JapanMapPlotter(GenericMapPlotter):
         cache_ttl_days=30,
         clip_features=True,
         clip_buffer_ratio=0.05,
+        **kwargs
     ):
         logger.info("Initializing JapanMapPlotter...")
 
@@ -124,6 +125,7 @@ class JapanMapPlotter(GenericMapPlotter):
             cache_ttl_days=cache_ttl_days,
             clip_features=clip_features,
             clip_buffer_ratio=clip_buffer_ratio,
+            **kwargs
         )
 
         self.admin_widths = style.japan_admin.boundary_widths_pt

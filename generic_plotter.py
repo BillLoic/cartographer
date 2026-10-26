@@ -250,6 +250,7 @@ class GenericMapPlotter:
         cache_ttl_days=30,
         clip_features=True,
         clip_buffer_ratio=0.05,
+        query_padding=0.08
     ):
         logger.info("Initializing GenericMapPlotter...")
 
@@ -331,6 +332,10 @@ class GenericMapPlotter:
             mode_str,
             self.projection.upper(),
         )
+        self.target_bbox = bbox 
+        self.query_bbox = self._calculate_query_bbox(bbox, query_padding) if bbox else None
+        
+        logger.info("Query Bbox is %s.", self.query_bbox)
 
     # ------------------------------------------------------------------
     # Validation
@@ -563,9 +568,9 @@ class GenericMapPlotter:
             "Road graph not present in application cache; requesting OSM data..."
         )
 
-        if self.bbox:
+        if self.query_bbox:
             graph = ox.graph_from_bbox(
-                bbox=self.bbox,
+                bbox=self.query_bbox,
                 network_type="drive",
                 custom_filter=custom_filter,
             )
@@ -622,15 +627,23 @@ class GenericMapPlotter:
         )
 
     def _calculate_bounds(self):
-        """Calculate authoritative plotting bounds from network geometry."""
-        self.minx, self.miny, self.maxx, self.maxy = self.gdf_nodes.total_bounds
+        """強制以使用者原始指定的 target_bbox 作為最終視角與邊界，不受外擴查詢影響。"""
+        if self.target_bbox:
+            w, s, e, n = self.target_bbox
+            # 如果有做投影轉換，需要把 WGS84 的 target_bbox 轉成目標投影坐標系
+            if self.projection != "wgs84" and self.crs != "EPSG:4326":
+                transformer = Transformer.from_crs("EPSG:4326", self.crs, always_xy=True)
+                self.minx, self.miny = transformer.transform(w, s)
+                self.maxx, self.maxy = transformer.transform(e, n)
+            else:
+                self.minx, self.miny, self.maxx, self.maxy = w, s, e, n
+        else:
+            # Center point 模式維持原本邏輯
+            self.minx, self.miny, self.maxx, self.maxy = self.gdf_nodes.total_bounds
 
         logger.debug(
-            "Computed total bounds: (%.6f, %.6f, %.6f, %.6f)",
-            self.minx,
-            self.miny,
-            self.maxx,
-            self.maxy,
+            "Strict viewport bounds established: (%.6f, %.6f, %.6f, %.6f)",
+            self.minx, self.miny, self.maxx, self.maxy,
         )
 
     # ------------------------------------------------------------------
@@ -683,6 +696,9 @@ class GenericMapPlotter:
         download auditing, automatic spatial clipping, and empty-set protection.
         """
         t0 = time.perf_counter()
+        
+        # 將原本的 self.bbox 改為 self.query_bbox
+        
 
         payload = {
             **self._location_cache_payload(),
@@ -707,8 +723,8 @@ class GenericMapPlotter:
         logger.info("Fetching '%s' features from OSM...", layer_name)
 
         try:
-            if self.bbox:
-                raw = ox.features_from_bbox(bbox=self.bbox, tags=tags)
+            if self.query_bbox:
+                raw = ox.features_from_bbox(bbox=self.query_bbox, tags=tags)
             else:
                 raw = ox.features_from_point(
                     self.center_point, tags=tags, dist=self.dist
@@ -755,6 +771,17 @@ class GenericMapPlotter:
 
             logger.error("Fatal error while fetching '%s': %s", layer_name, exc)
             raise
+        
+    def _calculate_query_bbox(self, bbox, padding: float):
+        """將使用者 BBox 向外擴展指定的比例（例如 8%），用於向 API 抓取更寬鬆的周邊資料。"""
+        west, south, east, north = bbox
+        w_span = east - west
+        h_span = north - south
+        
+        dx = w_span * padding
+        dy = h_span * padding
+        
+        return (west - dx, south - dy, east + dx, north + dy)
 
     # ------------------------------------------------------------------
     # Canvas construction
@@ -1312,6 +1339,54 @@ class GenericMapPlotter:
 
         logger.info("Airport rendering complete.")
         return self
+    
+    def draw_landuse(self):
+        """
+        Retrieve and draw OSM landuse polygons (industrial, commercial, 
+        residential, construction, etc.) with proper z-ordering.
+        """
+        logger.info("Drawing landuse features...")
+
+        if getattr(self, "gdf_landuse", None) is None:
+            tags = {
+                "landuse": [
+                    "industrial",
+                    "commercial",
+                    "retail",
+                    "residential",
+                    "construction",
+                    "military",
+                    "quarry",
+                    "cemetery",
+                    "brownfield",
+                    "landfill",
+                ]
+            }
+            self.gdf_landuse = self._fetch_features(tags, layer_name="landuse")
+
+        if self.gdf_landuse is not None and not self.gdf_landuse.empty:
+            poly_gdf = self.gdf_landuse[
+                self.gdf_landuse.geometry.type.isin(["Polygon", "MultiPolygon"])
+            ].copy()
+
+            if not poly_gdf.empty:
+                style = self.style.landuse
+                
+                # Vectorized mapping of landuse types to style colors
+                lu_series = poly_gdf["landuse"].apply(
+                    lambda v: v[0] if isinstance(v, list) else v
+                )
+                poly_gdf["render_color"] = lu_series.map(style.colors).fillna(style.default_color)
+
+                poly_gdf.plot(
+                    ax=self.ax,
+                    color=poly_gdf["render_color"],
+                    alpha=style.alpha,
+                    edgecolor="none",
+                    zorder=style.zorder,
+                )
+
+        return self
 
     # ------------------------------------------------------------------
     # Grid / coordinates / scale
@@ -1448,6 +1523,73 @@ class GenericMapPlotter:
                 return cell_label
 
         return None
+    
+    def calculate_optimal_grid(self, min_cell_cm: float = 4.0) -> tuple[int, int]:
+        """
+        Automatically calculate the optimal number of grid rows and columns 
+        based on the actual rendered canvas dimensions, keeping cells as close 
+        to square as possible while ensuring the side length is not smaller 
+        than the specified minimum (default 4 cm).
+
+        Parameters
+        ----------
+        min_cell_cm : float
+            The minimum desired side length for each grid cell in centimeters.
+
+        Returns
+        -------
+        tuple[int, int]
+            A tuple of (rows, cols) optimized for square-like cells.
+
+        Example
+        -------
+        >>> rows, cols = plotter.calculate_optimal_grid(min_cell_cm=4.0)
+        >>> plotter.draw_grid(rows=rows, cols=cols)
+        """
+        if self.render_context is None:
+            raise ValueError(
+                "Render context is unavailable. Call setup_canvas() first."
+            )
+
+        # Convert physical axes dimensions from inches to centimeters
+        axes_w_cm = self.render_context.axes_width_in * 2.54
+        axes_h_cm = self.render_context.axes_height_in * 2.54
+
+        # Calculate maximum possible divisions while enforcing the minimum cell size
+        max_cols = max(1, int(axes_w_cm // min_cell_cm))
+        max_rows = max(1, int(axes_h_cm // min_cell_cm))
+
+        if max_cols == 1 and max_rows == 1:
+            return 1, 1
+
+        # Match the canvas aspect ratio to keep grid cells as square as possible
+        aspect_ratio = axes_w_cm / axes_h_cm
+
+        if aspect_ratio >= 1.0:
+            rows = max_rows
+            cols = max(1, round(rows * aspect_ratio))
+            # Ensure cell width does not drop below min_cell_cm
+            while (axes_w_cm / cols) < min_cell_cm and cols > 1:
+                cols -= 1
+        else:
+            cols = max_cols
+            rows = max(1, round(cols / aspect_ratio))
+            # Ensure cell height does not drop below min_cell_cm
+            while (axes_h_cm / rows) < min_cell_cm and rows > 1:
+                rows -= 1
+
+        cell_w = axes_w_cm / cols
+        cell_h = axes_h_cm / rows
+
+        logger.info(
+            "Optimal grid calculated: %d rows × %d cols | Cell dimensions approx: %.1f cm × %.1f cm",
+            rows,
+            cols,
+            cell_w,
+            cell_h,
+        )
+
+        return rows, cols
 
     def draw_coordinates(self):
         """Draw geographic DMS coordinate ticks along map borders."""
