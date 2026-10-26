@@ -50,8 +50,8 @@ class RoadStyle:
     widths_pt: pd.Series = field(
         default_factory=lambda: pd.Series(
             {
-                "motorway": 4.0,
-                "motorway_link": 3.0,
+                "motorway": 5.0,
+                "motorway_link": 4.0,
                 "trunk": 3.5,
                 "trunk_link": 2.5,
                 "primary": 2.5,
@@ -238,7 +238,8 @@ class JapanAdminStyle:
             6: 84,
             7: 60,
             8: 45,
-            9: 34,
+            9: 18,
+            10: 6
         }
     )
     label_secondary_ratio: float = 0.65
@@ -252,7 +253,7 @@ class JapanAdminStyle:
             "borough": 14.0,
             "village": 13.0,
             "quarter": 11.5,
-            "neighbourhood": 22.0,
+            "neighbourhood": 11.5,
             "hamlet": 9.0,
             "isolated_dwelling": 8.5,
         }

@@ -3,6 +3,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.patheffects as pe
 import random, math, re
+from shapely import MultiPolygon
 
 # ==========================================
 # EnglandMapPlotter: UK Geography & Suburbs

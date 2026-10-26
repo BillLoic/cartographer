@@ -62,8 +62,8 @@ _PLACE_TO_ADMIN_LEVEL = {
     "town": 7,
     "suburb": 7,
     "borough": 7,
-    "village": 8,
-    "quarter": 8,
+    "village": 9,
+    "quarter": 9,
     "neighbourhood": 9,
     "hamlet": 9,
     "isolated_dwelling": 9,
@@ -147,7 +147,7 @@ class JapanMapPlotter(GenericMapPlotter):
     def _fetch_and_categorize_admins(self):
         """
         Fetch Japanese administrative boundaries once and categorize by admin_level.
-        Explicitly filters out historical entities (e.g. ancient provinces like Shimosa).
+        Filters out historical entities, non-administrative boundaries, and missing levels.
         """
         if self._admins_fetched:
             return
@@ -181,7 +181,6 @@ class JapanMapPlotter(GenericMapPlotter):
                 is_historic = is_historic | df[col].notna() & (df[col].astype(str).str.lower() != "nan")
 
             if "historic" in df.columns:
-                # If 'historic' is explicitly set to something like 'province' or 'yes'
                 is_historic = is_historic | df["historic"].notna()
 
             # --------------------------------------------------------------
@@ -191,12 +190,38 @@ class JapanMapPlotter(GenericMapPlotter):
                 has_ended = df["end_date"].notna() & (df["end_date"].astype(str).str.strip() != "")
                 is_historic = is_historic | has_ended
 
-            # Keep only modern, active administrative boundaries
-            df_modern = df[~is_historic].copy()
+            # --------------------------------------------------------------
+            # 🌟 FILTER 3: Drop non-administrative boundaries (e.g. protected areas, parks)
+            # --------------------------------------------------------------
+            if "boundary" in df.columns:
+                boundary_series = df["boundary"].apply(
+                    lambda v: str(v[0]).lower() if isinstance(v, list) else str(v).lower()
+                )
+                is_not_admin = boundary_series != "administrative"
+            else:
+                is_not_admin = pd.Series(True, index=df.index)
+
+            # --------------------------------------------------------------
+            # 🌟 FILTER 4: Ensure a valid, numeric admin_level exists
+            # --------------------------------------------------------------
+            if "admin_level" in df.columns:
+                def _is_valid_level(val):
+                    if isinstance(val, list):
+                        val = val[0] if val else None
+                    if val is None or pd.isna(val):
+                        return False
+                    s = str(val).strip()
+                    return s.replace(".", "", 1).isdigit()
+
+                has_valid_level = df["admin_level"].apply(_is_valid_level)
+            else:
+                has_valid_level = pd.Series(False, index=df.index)
+
+            # Combine all filters: Must be active + strictly administrative + have valid level
+            df_modern = df[~is_historic & ~is_not_admin & has_valid_level].copy()
 
             logger.info(
-                "Filtered out %d historical boundaries (e.g., ancient provinces). Remaining modern: %d",
-                len(df) - len(df_modern),
+                "Filtered out historical/non-administrative boundaries. Remaining valid modern: %d",
                 len(df_modern),
             )
 
@@ -550,9 +575,10 @@ class JapanMapPlotter(GenericMapPlotter):
                     ):
                         continue
 
-                    raw_pri, sec_name = self._extract_bilingual_names(
+                    raw_pri, _ = self._extract_bilingual_names(
                         row, uppercase_secondary=(equiv_level == 9)
                     )
+                    sec_name = ""
                     if not raw_pri or raw_pri in placed_names:
                         continue
 
@@ -605,7 +631,8 @@ class JapanMapPlotter(GenericMapPlotter):
                         alpha_secondary=0.65,
                         zorder=5.9,
                     )
-                    #logger.info("Rendering %s...", raw_pri)
+                    logger.info("Rendering %s (Type: %s, Text size: %s)...", raw_pri, place_type, pri_fs)
+                    # Bilangul disabled because of crowded layout.
 
                 logger.info(
                     "Supplemented map with %d local place-node labels.",

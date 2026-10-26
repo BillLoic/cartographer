@@ -15,10 +15,10 @@ if __name__ == "__main__":
     )
 
     bbox = (
-        140.344532, 
-        35.736127, 
-        140.409755,
-        35.820426, 
+        139.515665, 
+        35.833807,
+        139.745545,
+        36.08452, 
     )
 
     style = JapanMapStyle()
@@ -27,8 +27,8 @@ if __name__ == "__main__":
     style.japan_railways.heavy_width_pt = 6.0
 
     style.roads.adaptive_widths = True
-    style.roads.reference_scale = 25_000
-    style.roads.width_scale_exponent = 0.50
+    style.roads.reference_scale = 25000
+    style.roads.width_scale_exponent = 0.5
 
     plotter = JapanMapPlotter(
         bbox=bbox,
@@ -40,13 +40,13 @@ if __name__ == "__main__":
     )
     
     # 1. Setup canvas first so render_context is established
-    plotter.setup_canvas(base_width=16)
+    plotter.setup_canvas(base_width=36)
 
     # 2. Optionally calculate optimal rows and cols (cells >= 4cm, square-like)
-    opt_rows, opt_cols = plotter.calculate_optimal_grid(min_cell_cm=4.0)
+    opt_rows, opt_cols = plotter.calculate_optimal_grid(min_cell_cm=8.0)
 
     (
-        plotter.setup_canvas(base_width=16)
+        plotter
         .draw_land()
         .draw_greenery()
         .draw_buildings()
@@ -81,7 +81,7 @@ if __name__ == "__main__":
 
     logger.info("Saving map to disk...")
     plt.savefig(
-        "output_maps/tokyo_map_v2.png",
+        "output_maps/saitama_36.png",
         dpi=200,
         facecolor=plotter.fig.get_facecolor(),
         edgecolor="none",

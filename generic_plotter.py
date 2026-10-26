@@ -1147,13 +1147,19 @@ class GenericMapPlotter:
             metric_polys = self._to_metric(poly_gdf)
             for _, row in metric_polys.iterrows():
                 aeroway = row.get("aeroway")
+                if isinstance(aeroway, list):
+                    aeroway = aeroway[0] if aeroway else ""
                 if aeroway in final_surfaces:
                     final_surfaces[aeroway].append(row.geometry)
 
         if not line_gdf.empty:
             metric_lines = self._to_metric(line_gdf)
-            for source_idx, metric_row in metric_lines.iterrows():
-                aeroway = line_gdf.loc[source_idx, "aeroway"]
+            for _, metric_row in metric_lines.iterrows():
+                # 🌟 直接從當前迭代的 metric_row 取得 aeroway，避免 index 重複導致 .loc 回傳 Series
+                aeroway = metric_row.get("aeroway")
+                if isinstance(aeroway, list):
+                    aeroway = aeroway[0] if aeroway else ""
+
                 if aeroway not in final_surfaces:
                     continue
 
@@ -1167,10 +1173,9 @@ class GenericMapPlotter:
                     else airport_style.default_taxiway_width_m
                 )
 
-                width_m = self._parse_width_m(
-                    line_gdf.loc[source_idx, "width"],
-                    default_width,
-                )
+                # 🌟 同理，寬度也直接從 metric_row 取得
+                width_raw = metric_row.get("width")
+                width_m = self._parse_width_m(width_raw, default_width)
 
                 final_surfaces[aeroway].append(geom.buffer(width_m / 2.0))
 
@@ -1400,7 +1405,10 @@ class GenericMapPlotter:
         alpha=None,
         linewidth=None,
     ):
-        """Draw the alphanumeric map grid (linewidth in POINTS)."""
+        """
+        Draw the alphanumeric map grid (linewidth in POINTS).
+        Supports Excel-style column labeling (A-Z, then AA, AB, AC...) for large maps.
+        """
         if self.ax is None:
             raise ValueError("Canvas not found.")
 
@@ -1420,7 +1428,16 @@ class GenericMapPlotter:
             self.miny + j * (self.maxy - self.miny) / rows
             for j in range(rows + 1)
         ]
-        cols_labels = [chr(65 + i) for i in range(cols)]
+
+        # 🌟 Excel-style column label generator (A-Z, AA, AB, AC...)
+        def _get_col_label(n: int) -> str:
+            res = []
+            while n >= 0:
+                res.append(chr(65 + n % 26))
+                n = n // 26 - 1
+            return "".join(reversed(res))
+
+        cols_labels = [_get_col_label(i) for i in range(cols)]
 
         for i, x in enumerate(x_steps):
             self.ax.plot(
