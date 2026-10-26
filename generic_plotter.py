@@ -1,146 +1,302 @@
-import warnings
+"""
+generic_plotter.py
+
+Generic geographic/map rendering engine (v2 Architecture).
+
+Includes:
+    * Strict Unit Contract (CRS units, physical metres, visual points, scale)
+    * RenderContext with WGS84 geodesic ground metrics
+    * Local metric CRS estimation for safe physical buffering
+    * Two-tier application caching (OSMDataCache)
+    * Download auditing (rows, vertices, memory footprint, span ratio)
+    * Automatic spatial clipping (prevents oversized OSM geometries)
+    * Viewport locking and margin protection for titles and grid labels
+"""
+
+from __future__ import annotations
+
 import logging
-import osmnx as ox
-import matplotlib.pyplot as plt
-import matplotlib.patheffects as pe
 import math
-import random
-import pandas as pd
 import re
+import time
+from dataclasses import dataclass
+
 import geopandas as gpd
-from shapely.geometry import Polygon, MultiPolygon, box
-from shapely.ops import unary_union
-from pyproj import Transformer
+import matplotlib.patheffects as pe
+import matplotlib.pyplot as plt
+import numpy as np
+import osmnx as ox
+import pandas as pd
+from pyproj import CRS, Geod, Transformer
+from shapely.geometry import box
 
-# Font configurations for CJK compatibility (kept as requested)
-plt.rcParams['font.sans-serif'] = ['Source Han Sans JP Normal', 'sans-serif']
-plt.rcParams['axes.unicode_minus'] = False
+from map_styles import MapStyle
+from osm_cache import OSMDataCache
 
-# Configure basic logging
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] [%(name)s] [%(filename)s:%(lineno)s] -> %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
+
 logger = logging.getLogger("GenericPlotter")
+
+# Keep OSMnx's HTTP cache enabled alongside OSMDataCache.
 ox.settings.use_cache = True
 
-# ==========================================
-# Shared Utility Functions
-# ==========================================
-def _get_actual_ax_size_cm(fig, ax):
-    """Calculate the actual physical size of the Matplotlib axes in centimeters."""
-    bbox = ax.get_window_extent().transformed(fig.dpi_scale_trans.inverted())
-    width_cm, height_cm = bbox.width * 2.54, bbox.height * 2.54
-    logger.debug(f"Calculated axes size: {width_cm:.2f} cm x {height_cm:.2f} cm")
-    return width_cm, height_cm
 
-def _compute_ground_metrics(minx, miny, maxx, maxy, crs):
-    """Compute the actual ground distance in meters for the given bounding box."""
-    logger.debug(f"Computing ground metrics for CRS: {crs}")
-    if crs == "EPSG:4326":
-        # Calculate distance using WGS84 ellipsoid parameters
-        a, b = 6378137.0, 6356752.314245
-        e_sq = 1.0 - (b**2 / a**2)
-        center_lat = math.radians((miny + maxy) / 2.0)
-        sin_lat = math.sin(center_lat)
-        N = a / math.sqrt(1.0 - e_sq * sin_lat**2)
-        M = (a * (1.0 - e_sq)) / math.pow(1.0 - e_sq * sin_lat**2, 1.5)
+@dataclass(frozen=True)
+class RenderContext:
+    """
+    Physical information about the current rendering.
+    All values are explicit.
+    """
 
-        ground_w_m = math.radians(maxx - minx) * N * math.cos(center_lat)
-        ground_h_m = math.radians(maxy - miny) * M
-    else:
-        # Assuming projected CRS units are already in meters
-        ground_w_m = maxx - minx
-        ground_h_m = maxy - miny
+    ground_width_m: float
+    ground_height_m: float
 
-    logger.debug(f"Ground metrics - Width: {ground_w_m:.2f}m, Height: {ground_h_m:.2f}m")
-    return ground_w_m, ground_h_m
+    axes_width_in: float
+    axes_height_in: float
 
-def decorate_map_layout(fig, ax, plotter, title_text="Urban Map"):
-    """Decorate the map with titles and scale information based on calculated dimensions."""
-    logger.info("Decorating map layout with title and dimension details...")
-    fig.canvas.draw() if fig.canvas else None
-    ax_width_cm, ax_height_cm = _get_actual_ax_size_cm(fig, ax)
+    scale_x: float
+    scale_y: float
 
-    ground_w_m, ground_h_m = _compute_ground_metrics(
-        plotter.minx, plotter.miny, plotter.maxx, plotter.maxy, plotter.crs
+    map_units_per_ground_meter_x: float
+    map_units_per_ground_meter_y: float
+
+    dpi: float
+
+    @property
+    def representative_scale(self) -> float:
+        """Return the geometric mean of horizontal and vertical scale."""
+        return math.sqrt(max(self.scale_x, 1e-12) * max(self.scale_y, 1e-12))
+
+    @property
+    def axes_width_pt(self) -> float:
+        """Actual physical axes width in Matplotlib points."""
+        return self.axes_width_in * 72.0
+
+    @property
+    def axes_height_pt(self) -> float:
+        """Actual physical axes height in Matplotlib points."""
+        return self.axes_height_in * 72.0
+
+
+# ----------------------------------------------------------------------
+# Unit / measurement utilities
+# ----------------------------------------------------------------------
+
+_GEOD = Geod(ellps="WGS84")
+
+
+def _get_actual_ax_size_in(fig, ax) -> tuple[float, float]:
+    """
+    Return the actual physical axes dimensions in inches.
+    Measures the AXES rather than the whole figure.
+    """
+    if fig.canvas is not None:
+        fig.canvas.draw()
+
+    bbox = ax.get_window_extent().transformed(
+        fig.dpi_scale_trans.inverted()
     )
 
-    scale_x = ground_w_m / (ax_width_cm * 0.01)
-    scale_y = ground_h_m / (ax_height_cm * 0.01)
+    return bbox.width, bbox.height
+
+
+def _compute_ground_metrics(
+    minx: float,
+    miny: float,
+    maxx: float,
+    maxy: float,
+    crs,
+) -> tuple[float, float]:
+    """
+    Calculate horizontal/vertical ground dimensions in metres.
+    Uses WGS84 ellipsoid geodesic distances for geographic CRS.
+    """
+    crs_obj = CRS.from_user_input(crs)
+
+    if crs_obj.is_geographic:
+        mid_lat = (miny + maxy) / 2.0
+        mid_lon = (minx + maxx) / 2.0
+
+        _, _, ground_w_m = _GEOD.inv(minx, mid_lat, maxx, mid_lat)
+        _, _, ground_h_m = _GEOD.inv(mid_lon, miny, mid_lon, maxy)
+
+        return abs(ground_w_m), abs(ground_h_m)
+
+    return abs(maxx - minx), abs(maxy - miny)
+
+
+def _is_metric_crs(crs) -> bool:
+    """Return True when the first CRS axis uses metres."""
+    crs_obj = CRS.from_user_input(crs)
+
+    if not crs_obj.is_projected or not crs_obj.axis_info:
+        return False
+
+    unit_name = crs_obj.axis_info[0].unit_name.lower()
+
+    return unit_name in {"metre", "meter", "metres", "meters"}
+
+
+def _adaptive_width(
+    base_width_pt: float,
+    render_context: RenderContext | None,
+    adaptive: bool,
+    reference_scale: float,
+    exponent: float,
+    minimum_pt: float,
+    maximum_pt: float,
+) -> float:
+    """Convert a base point width into its final scale-adjusted rendering width."""
+    if not adaptive or render_context is None:
+        return base_width_pt
+
+    actual_scale = max(render_context.representative_scale, 1.0)
+    factor = (reference_scale / actual_scale) ** exponent
+
+    return max(minimum_pt, min(maximum_pt, base_width_pt * factor))
+
+
+def _count_geometry_vertices(geom) -> int:
+    """Safely count total coordinate vertices across any Shapely geometry type."""
+    if geom is None or geom.is_empty:
+        return 0
+
+    gtype = geom.geom_type
+    if gtype == "Point":
+        return 1
+    if gtype in ("LineString", "LinearRing"):
+        return len(geom.coords)
+    if gtype == "Polygon":
+        interior_pts = sum(len(ring.coords) for ring in geom.interiors)
+        return len(geom.exterior.coords) + interior_pts
+    if hasattr(geom, "geoms"):
+        return sum(_count_geometry_vertices(sub) for sub in geom.geoms)
+
+    return 0
+
+
+# ----------------------------------------------------------------------
+# Layout decoration
+# ----------------------------------------------------------------------
+
+def decorate_map_layout(
+    fig,
+    ax,
+    plotter: GenericMapPlotter,
+    title_text: str = "Urban Map",
+):
+    """
+    Decorate the map with title and calculated physical dimensions
+    derived directly from the plotter's RenderContext.
+    """
+    logger.info("Decorating map layout with title and dimension details...")
+
+    context = plotter.render_context
+    if context is None:
+        raise ValueError(
+            "Render context is unavailable. Call setup_canvas() first."
+        )
+
+    ax_width_cm = context.axes_width_in * 2.54
+    ax_height_cm = context.axes_height_in * 2.54
 
     full_title = (
         f"{title_text}\n"
         f"Dimensions: {ax_width_cm:.1f} cm × {ax_height_cm:.1f} cm  |  "
-        f"Scale H: 1:{int(scale_x):,}  |  Scale V: 1:{int(scale_y):,}"
+        f"Scale H: 1:{int(context.scale_x):,}  |  "
+        f"Scale V: 1:{int(context.scale_y):,}"
     )
 
     ax.set_title(
-        full_title, 
-        color="white", 
-        fontsize=14, 
-        fontfamily='monospace', 
-        fontweight='bold', 
-        pad=15,
-        ha='center'
+        full_title,
+        color="white",
+        fontsize=14,
+        fontfamily="monospace",
+        fontweight="bold",
+        pad=18,
+        ha="center",
     )
-    logger.info(f"Layout decorated successfully. Size: {ax_width_cm:.1f}x{ax_height_cm:.1f} cm | H-Scale: 1:{int(scale_x):,} | V-Scale: 1:{int(scale_y):,}")
+
+    logger.info(
+        "Layout decorated successfully. Size: %.1fx%.1f cm",
+        ax_width_cm,
+        ax_height_cm,
+    )
 
 
-# ==========================================
-# GenericMapPlotter: Core Physical Geography & Canvas
-# ==========================================
+# ======================================================================
+# GenericMapPlotter
+# ======================================================================
+
 class GenericMapPlotter:
     """
     Generic physical geography and map foundation plotting class.
-    Handles projection, base grid, land, water, vegetation, buildings, and general road systems.
+    Country-neutral core engine.
     """
-    def __init__(self, bbox=None, center_point=None, dist=5000, 
-                 custom_linewidths=None, custom_colors=None, 
-                 bg_color="#cfe4fe", land_color="#54ead1", projection="wgs84"):
 
+    def __init__(
+        self,
+        bbox=None,
+        center_point=None,
+        dist=5000,
+        custom_linewidths=None,
+        custom_colors=None,
+        bg_color=None,
+        land_color=None,
+        projection="wgs84",
+        style: MapStyle | None = None,
+        cache: OSMDataCache | None = None,
+        cache_enabled=True,
+        cache_dir=None,
+        cache_ttl_days=30,
+        clip_features=True,
+        clip_buffer_ratio=0.05,
+    ):
         logger.info("Initializing GenericMapPlotter...")
+
         if (bbox is None) == (center_point is None):
-            logger.error("Initialization failed: Both or neither 'bbox' and 'center_point' provided.")
-            raise ValueError("You must provide either 'bbox' OR 'center_point'.")
+            raise ValueError(
+                "You must provide either 'bbox' OR 'center_point'."
+            )
 
         self.bbox = bbox
         self.center_point = center_point
         self.dist = dist
 
-        if self.center_point: self._check_center_point()
-        if self.bbox: self._check_bbox()
+        if self.center_point:
+            self._check_center_point()
 
-        self.bg_color = bg_color
-        self.land_color = land_color
+        if self.bbox:
+            self._check_bbox()
 
-        self.linewidths_map = {
-            'motorway': 4.0, 'motorway_link': 3.0, 'trunk': 3.5, 'trunk_link': 2.5,
-            'primary': 2.5,  'primary_link': 2.0, 'secondary': 1.5,'secondary_link': 1.0,
-            'tertiary': 1.0, 'tertiary_link': 0.8,
-            'residential': 0.5, 'unclassified': 0.5, 'living_street': 0.5
-        }
-        if custom_linewidths: 
-            self.linewidths_map.update(custom_linewidths)
-            logger.debug("Custom linewidths updated.")
+        self.style = style or MapStyle()
 
-        self.color_map = {
-            'motorway': '#e63946',  'motorway_link': "#c934ea",
-            'trunk': '#f4a261',     'trunk_link': "#ff6f00",
-            'primary': '#e9c46a',   'primary_link': '#e9c46a',
-            'secondary': '#2a9d8f', 'secondary_link': '#2a9d8f',
-            'tertiary': "#19567c",  'tertiary_link': "#19567c",
-            'residential': '#555555', 'unclassified': '#555555', 'living_street': '#555555'
-        }
-        if custom_colors: 
-            self.color_map.update(custom_colors)
-            logger.debug("Custom colors updated.")
+        # Backward-compatible explicit overrides
+        if bg_color is not None:
+            self.style.base.background = bg_color
+            self.style.base.water = bg_color
+
+        if land_color is not None:
+            self.style.base.land = land_color
+
+        if custom_linewidths:
+            self.style.roads.widths_pt.update(pd.Series(custom_linewidths))
+
+        if custom_colors:
+            self.style.roads.colors.update(pd.Series(custom_colors))
+
+        self.bg_color = self.style.base.background
+        self.land_color = self.style.base.land
 
         self.projection = projection.lower()
-        self.crs = "EPSG:4326" 
+        self.crs = "EPSG:4326"
+        self.metric_crs = None
+
+        # Spatial clipping configuration
+        self.clip_features = bool(clip_features)
+        self.clip_buffer_ratio = float(clip_buffer_ratio)
 
         self.G = None
+
         self.gdf_admin_base = None
         self.gdf_water = None
         self.gdf_nodes = None
@@ -152,336 +308,1101 @@ class GenericMapPlotter:
         self.fig = None
         self.ax = None
         self._is_user_ax = False
-        self.minx = self.miny = self.maxx = self.maxy = 0
 
-        mode_str = f"BBox mode ({self.bbox})" if self.bbox else f"Center Point mode ({self.center_point}, dist: {self.dist}m)"
-        logger.info(f"GenericMapPlotter initialized with {mode_str} | Projection: {self.projection.upper()}")
+        self.minx = self.miny = self.maxx = self.maxy = 0.0
+        self.render_context: RenderContext | None = None
+
+        self.cache = cache or OSMDataCache(
+            cache_dir=cache_dir,
+            ttl_days=cache_ttl_days,
+            enabled=cache_enabled,
+        )
+
+        mode_str = (
+            f"BBox mode ({self.bbox})"
+            if self.bbox
+            else f"Center Point mode ({self.center_point}, dist: {self.dist}m)"
+        )
+
+        logger.info(
+            "GenericMapPlotter initialized with %s | Projection: %s",
+            mode_str,
+            self.projection.upper(),
+        )
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
 
     def _check_center_point(self):
         lat, lon = self.center_point
-        if not (-90 <= lat <= 90 and -180 <= lon <= 180): 
-            logger.error(f"Invalid center point coordinates provided: {self.center_point}")
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
             raise ValueError("Invalid center point.")
-        logger.debug(f"Center point {self.center_point} validated.")
 
     def _check_bbox(self):
         west, south, east, north = self.bbox
-        if not (-180 <= west <= 180 and -180 <= east <= 180 and -90 <= south <= 90 and -90 <= north <= 90): 
-            logger.error(f"Invalid bounding box coordinates provided: {self.bbox}")
+        if not (
+            -180 <= west <= 180
+            and -180 <= east <= 180
+            and -90 <= south <= 90
+            and -90 <= north <= 90
+        ):
             raise ValueError("Invalid BBox.")
-        if west >= east or south >= north: 
-            logger.error(f"Invalid bounding box range (west >= east or south >= north): {self.bbox}")
+
+        if west >= east or south >= north:
             raise ValueError("Invalid BBox range.")
-        logger.debug(f"Bounding box {self.bbox} validated.")
 
-    def _check_is_yes(self, attr):
-        if attr is None: return False
-        if isinstance(attr, str): return attr == 'yes'
-        if isinstance(attr, list): return 'yes' in attr
-        return (attr == 'yes').any() if hasattr(attr, 'any') else False
+    # ------------------------------------------------------------------
+    # CRS helpers
+    # ------------------------------------------------------------------
 
-    def _project(self, gdf):
+    def _project(self, gdf: gpd.GeoDataFrame | None) -> gpd.GeoDataFrame | None:
+        """Project a GeoDataFrame into the active rendering CRS."""
         if gdf is not None and not gdf.empty and self.crs != "EPSG:4326":
-            logger.debug(f"Projecting GeoDataFrame to {self.crs}...")
             return gdf.to_crs(self.crs)
         return gdf
 
-    def _process_edges(self):
-        logger.info("Processing road network edges (categorization and styling)...")
-        edge_colors, edge_widths, edge_zorders = [], [], []
-        
-        for u, v, k, data in self.G.edges(keys=True, data=True):
-            hw = data.get('highway', 'unclassified')
-            hw = hw[0] if isinstance(hw, list) else (str(hw.iloc[0]) if hasattr(hw, 'iloc') else hw)
+    def _determine_metric_crs(self):
+        """Determine a CRS suitable for physical measurements in metres."""
+        if _is_metric_crs(self.crs):
+            self.metric_crs = self.crs
+            return self.metric_crs
 
-            is_bridge, is_tunnel = self._check_is_yes(data.get('bridge')), self._check_is_yes(data.get('tunnel'))
-            width = self.linewidths_map.get(hw, 0.5)
+        if self.gdf_nodes is None or self.gdf_nodes.empty:
+            raise ValueError(
+                "Cannot determine metric CRS without network geometry."
+            )
 
-            if is_tunnel: 
-                color, zorder = self.color_map.get(hw, '#ff9999'), 1      
-            elif is_bridge: 
-                color, zorder = self.color_map.get(hw, '#ff9999'), 3        
-            else: 
-                color, zorder = self.color_map.get(hw, '#666666'), 2        
+        nodes_wgs84 = self.gdf_nodes.to_crs("EPSG:4326")
+        estimated = nodes_wgs84.estimate_utm_crs()
 
-            edge_widths.append(width)
-            edge_colors.append(color)
-            edge_zorders.append(zorder)
+        if estimated is None:
+            raise ValueError("Unable to estimate a metric CRS for this map.")
 
-        self.gdf_edges['custom_width'] = edge_widths
-        self.gdf_edges['custom_color'] = edge_colors
-        self.gdf_edges['custom_zorder'] = edge_zorders
-        logger.info(f"Successfully processed {len(self.gdf_edges)} road edges.")
+        self.metric_crs = estimated
+        logger.info(
+            "Metric CRS for physical geometry operations: %s",
+            self.metric_crs,
+        )
+        return self.metric_crs
 
-    def _fetch_features(self, tags, layer_name):
+    def _to_metric(self, gdf: gpd.GeoDataFrame | None) -> gpd.GeoDataFrame | None:
+        """Return a GeoDataFrame projected into the physical metric CRS."""
+        if gdf is None or gdf.empty:
+            return gdf
+
+        if self.metric_crs is None:
+            self._determine_metric_crs()
+
+        if CRS.from_user_input(gdf.crs) == CRS.from_user_input(self.metric_crs):
+            return gdf.copy()
+
+        return gdf.to_crs(self.metric_crs)
+
+    def _from_metric(self, gdf: gpd.GeoDataFrame | None) -> gpd.GeoDataFrame | None:
+        """Return metric geometry in the active rendering CRS."""
+        if gdf is None or gdf.empty:
+            return gdf
+
+        return gdf.to_crs(self.crs)
+
+    # ------------------------------------------------------------------
+    # Auditing & Spatial Clipping
+    # ------------------------------------------------------------------
+
+    def _audit_geodataframe(
+        self,
+        gdf: gpd.GeoDataFrame | None,
+        layer_name: str,
+        elapsed_sec: float,
+        source: str = "OSM",
+    ):
         """
-        Shared layer fetching logic.
-        Safely returns None if the area genuinely lacks the requested tags.
-        Raises an exception for fatal errors like network disconnections or API timeouts.
+        Audit a GeoDataFrame: log row count, total vertices, memory usage,
+        and spatial span ratio relative to the active map canvas.
         """
-        logger.info(f"Attempting to fetch '{layer_name}' features from OSM...")
-        logger.debug(f"Tags used for '{layer_name}': {tags}")
-        try:
-            raw = ox.features_from_bbox(bbox=self.bbox, tags=tags) if self.bbox else ox.features_from_point(self.center_point, tags=tags, dist=self.dist)
-            logger.info(f"Successfully retrieved '{layer_name}' features.")
-            return self._project(raw)
-        except Exception as e:
-            err_msg = str(e).lower()
-            # Benign exceptions (e.g., OSMnx didn't find features in this bounding box)
-            if any(keyword in err_msg for keyword in ['no data', 'empty', 'insufficient', 'not find', 'no features']):
-                logger.info(f"No features found for '{layer_name}' in this area. Safely ignoring.")
-                return None
-            else:
-                # Fatal errors (network issues, API downtime, etc.)
-                logger.error(f"Fatal error encountered while fetching '{layer_name}': {e}")
-                raise e
+        if gdf is None or gdf.empty:
+            logger.info(
+                "[Audit:%s] %-24s | Empty | %.2fs",
+                source,
+                layer_name,
+                elapsed_sec,
+            )
+            return
 
-    def setup_canvas(self, ax=None, base_width=96, highway_filter=None):
-        logger.info("Setting up map canvas and retrieving core road network...")
-        custom_filter = f'["highway"~"{"|".join(highway_filter)}"]' if highway_filter else None
+        mem_mb = gdf.memory_usage(deep=True).sum() / (1024.0 * 1024.0)
+        total_vertices = int(
+            np.sum([_count_geometry_vertices(g) for g in gdf.geometry])
+        )
 
-        # Network fetching (Network errors will organically raise exceptions from requests/urllib)
-        if self.bbox:
-            self.G = ox.graph_from_bbox(bbox=self.bbox, network_type="drive", custom_filter=custom_filter)
+        canvas_w = max(self.maxx - self.minx, 1e-9)
+        canvas_h = max(self.maxy - self.miny, 1e-9)
+
+        if self.maxx > self.minx and self.maxy > self.miny:
+            g_minx, g_miny, g_maxx, g_maxy = gdf.total_bounds
+            span_x = (g_maxx - g_minx) / canvas_w
+            span_y = (g_maxy - g_miny) / canvas_h
         else:
-            self.G = ox.graph_from_point(self.center_point, dist=self.dist, network_type="drive", custom_filter=custom_filter)
-        
-        logger.info("Road network graph successfully retrieved.")
+            span_x = span_y = 1.0
 
-        # Coordinate Reference System Handling
-        if self.projection != "wgs84":
-            logger.debug(f"Projecting graph to target projection: {self.projection}")
-            if self.projection in ["utm", "transverse_mercator"]:
-                self.G = ox.project_graph(self.G) 
-                self.crs = self.G.graph['crs']
-            else:
-                self.crs = {"conformal": "EPSG:3857", "mercator": "EPSG:3857", "equal_area": "+proj=cea", "equidistant": "+proj=eqc"}.get(self.projection, "EPSG:3857")
-                self.G = ox.project_graph(self.G, to_crs=self.crs)
-            logger.info(f"Graph projected successfully. CRS set to: {self.crs}")
+        logger.info(
+            "[Audit:%s] %-24s | Rows: %5d | Vertices: %7d | "
+            "Mem: %5.2f MB | Span: %4.1fx W, %4.1fx H | %.2fs",
+            source,
+            layer_name,
+            len(gdf),
+            total_vertices,
+            mem_mb,
+            span_x,
+            span_y,
+            elapsed_sec,
+        )
 
+        if span_x > 2.5 or span_y > 2.5:
+            logger.warning(
+                "Layer '%s' spans %.1fx the canvas extent! "
+                "Spatial clipping will trim out-of-bounds vertices.",
+                layer_name,
+                max(span_x, span_y),
+            )
+
+    def _clip_to_canvas(
+        self,
+        gdf: gpd.GeoDataFrame | None,
+        layer_name: str = "layer",
+    ) -> gpd.GeoDataFrame | None:
+        """
+        Spatially clip oversized geometries to the active canvas bounding box
+        (with a small margin buffer so boundary strokes do not terminate early).
+        """
+        if (
+            not self.clip_features
+            or gdf is None
+            or gdf.empty
+            or self.maxx <= self.minx
+            or self.maxy <= self.miny
+        ):
+            return gdf
+
+        dx = (self.maxx - self.minx) * self.clip_buffer_ratio
+        dy = (self.maxy - self.miny) * self.clip_buffer_ratio
+
+        clip_box = box(
+            self.minx - dx,
+            self.miny - dy,
+            self.maxx + dx,
+            self.maxy + dy,
+        )
+
+        try:
+            cleaned = gdf.copy()
+            # Repair self-intersecting OSM polygons before clipping
+            cleaned["geometry"] = cleaned.geometry.make_valid()
+            clipped = gpd.clip(cleaned, clip_box, keep_geom_type=True)
+            clipped = clipped[
+                clipped.geometry.notna() & ~clipped.geometry.is_empty
+            ].copy()
+            return clipped
+        except Exception as exc:
+            logger.warning(
+                "keep_geom_type clip failed on '%s' (%s); retrying standard clip...",
+                layer_name,
+                exc,
+            )
+            try:
+                clipped = gpd.clip(cleaned, clip_box, keep_geom_type=False)
+                return clipped[
+                    clipped.geometry.notna() & ~clipped.geometry.is_empty
+                ].copy()
+            except Exception as fallback_exc:
+                logger.warning(
+                    "Spatial clipping failed for '%s': %s. Returning unclipped GeoDataFrame.",
+                    layer_name,
+                    fallback_exc,
+                )
+                return gdf
+
+    # ------------------------------------------------------------------
+    # OSM cache keys
+    # ------------------------------------------------------------------
+
+    def _location_cache_payload(self) -> dict:
+        """Describe the geographic request independently of styling."""
+        if self.bbox is not None:
+            return {
+                "mode": "bbox",
+                "bbox": tuple(float(v) for v in self.bbox),
+            }
+
+        return {
+            "mode": "point",
+            "center_point": tuple(float(v) for v in self.center_point),
+            "dist_m": float(self.dist),
+        }
+
+    # ------------------------------------------------------------------
+    # Graph acquisition & preparation
+    # ------------------------------------------------------------------
+
+    def _fetch_drive_graph(self, custom_filter=None):
+        """Fetch the road graph, checking persistent application cache first."""
+        payload = {
+            **self._location_cache_payload(),
+            "network_type": "drive",
+            "custom_filter": custom_filter,
+            "osmnx_version": getattr(ox, "__version__", "unknown"),
+        }
+
+        graph = self.cache.get("graph", payload)
+        if graph is not None:
+            return graph
+
+        logger.info(
+            "Road graph not present in application cache; requesting OSM data..."
+        )
+
+        if self.bbox:
+            graph = ox.graph_from_bbox(
+                bbox=self.bbox,
+                network_type="drive",
+                custom_filter=custom_filter,
+            )
+        else:
+            graph = ox.graph_from_point(
+                self.center_point,
+                dist=self.dist,
+                network_type="drive",
+                custom_filter=custom_filter,
+            )
+
+        self.cache.set("graph", payload, graph)
+        return graph
+
+    def _project_graph(self, graph):
+        """Project the graph into the requested rendering CRS."""
+        if self.projection == "wgs84":
+            self.crs = "EPSG:4326"
+            return graph
+
+        logger.debug("Projecting graph to target projection: %s", self.projection)
+
+        if self.projection in {"utm", "transverse_mercator"}:
+            graph = ox.project_graph(graph)
+            self.crs = graph.graph["crs"]
+        else:
+            projection_map = {
+                "conformal": "EPSG:3857",
+                "mercator": "EPSG:3857",
+                "equal_area": "+proj=cea",
+                "equidistant": "+proj=eqc",
+            }
+            self.crs = projection_map.get(self.projection, "EPSG:3857")
+            graph = ox.project_graph(graph, to_crs=self.crs)
+
+        logger.info("Graph projected successfully. CRS=%s", self.crs)
+        return graph
+
+    def _prepare_network_geodata(self):
+        """Convert the NetworkX graph into GeoPandas objects and audit edges."""
+        t0 = time.perf_counter()
         self.gdf_nodes, self.gdf_edges = ox.graph_to_gdfs(self.G)
-        if self.gdf_nodes.empty: 
-            logger.error("Invalid graph bounds: No road nodes found after fetching.")
+
+        if self.gdf_nodes.empty:
             raise ValueError("Invalid graph bounds: No road nodes found.")
 
         self._process_edges()
-        self.minx, self.miny, self.maxx, self.maxy = self.gdf_nodes.total_bounds 
-        logger.debug(f"Computed total bounds for canvas: ({self.minx}, {self.miny}, {self.maxx}, {self.maxy})")
+        elapsed = time.perf_counter() - t0
+        self._audit_geodataframe(
+            self.gdf_edges,
+            layer_name="road_network_edges",
+            elapsed_sec=elapsed,
+            source="Graph",
+        )
 
-        # Canvas Construction
-        if ax is None:
-            logger.debug(f"Creating new Matplotlib figure with base_width={base_width}")
-            ground_w, ground_h = _compute_ground_metrics(self.minx, self.miny, self.maxx, self.maxy, self.crs)
-            aspect_ratio = ground_h / ground_w 
-            fig_height = base_width * aspect_ratio
+    def _calculate_bounds(self):
+        """Calculate authoritative plotting bounds from network geometry."""
+        self.minx, self.miny, self.maxx, self.maxy = self.gdf_nodes.total_bounds
 
-            self.fig, self.ax = plt.subplots(figsize=(base_width, fig_height))
-            self.fig.subplots_adjust(left=0, right=1, bottom=0, top=0.99)
-            self._is_user_ax = False
-            logger.info(f"New canvas initialized (Size: {base_width}x{fig_height:.2f}).")
-        else:
-            logger.info("Using provided Matplotlib axes.")
-            self.ax = ax
-            self.fig = ax.figure
-            self._is_user_ax = True
+        logger.debug(
+            "Computed total bounds: (%.6f, %.6f, %.6f, %.6f)",
+            self.minx,
+            self.miny,
+            self.maxx,
+            self.maxy,
+        )
 
+    # ------------------------------------------------------------------
+    # Road processing
+    # ------------------------------------------------------------------
+
+    def _process_edges(self):
+        """Process OSM road attributes using vectorized Pandas operations."""
+        logger.info("Processing road network edges using Pandas...")
+
+        hw_series = self.gdf_edges["highway"].apply(
+            lambda value: value[0] if isinstance(value, list) else value
+        )
+
+        road_style = self.style.roads
+
+        self.gdf_edges["custom_width_pt"] = (
+            hw_series.map(road_style.widths_pt).fillna(road_style.fallback_width_pt)
+        )
+        self.gdf_edges["custom_color"] = (
+            hw_series.map(road_style.colors).fillna(road_style.fallback_color)
+        )
+        self.gdf_edges["custom_zorder"] = road_style.ground_zorder
+
+        def is_yes(column):
+            if column not in self.gdf_edges.columns:
+                return pd.Series(False, index=self.gdf_edges.index)
+            return self.gdf_edges[column].apply(
+                lambda value: "yes" in value if isinstance(value, list) else value == "yes"
+            )
+
+        is_tunnel = is_yes("tunnel")
+        is_bridge = is_yes("bridge")
+
+        self.gdf_edges.loc[is_tunnel, "custom_zorder"] = road_style.tunnel_zorder
+        self.gdf_edges.loc[is_tunnel, "custom_color"] = road_style.tunnel_color
+
+        self.gdf_edges.loc[is_bridge, "custom_zorder"] = road_style.bridge_zorder
+        self.gdf_edges.loc[is_bridge, "custom_color"] = road_style.bridge_color
+
+        logger.info("Successfully processed %d road edges.", len(self.gdf_edges))
+
+    # ------------------------------------------------------------------
+    # Generic feature retrieval (with Cache + Audit + Spatial Clipping)
+    # ------------------------------------------------------------------
+
+    def _fetch_features(self, tags, layer_name: str) -> gpd.GeoDataFrame | None:
+        """
+        Fetch an OSM feature layer with application-level caching,
+        download auditing, and automatic spatial clipping to canvas bounds.
+        """
+        t0 = time.perf_counter()
+
+        payload = {
+            **self._location_cache_payload(),
+            "layer": layer_name,
+            "tags": tags,
+            "osmnx_version": getattr(ox, "__version__", "unknown"),
+        }
+
+        raw = self.cache.get("features", payload)
+
+        if raw is not None:
+            projected = self._project(raw.copy())
+            elapsed = time.perf_counter() - t0
+            self._audit_geodataframe(
+                projected, layer_name, elapsed, source="Cache"
+            )
+            return self._clip_to_canvas(projected, layer_name=layer_name)
+
+        logger.info("Fetching '%s' features from OSM...", layer_name)
+
+        try:
+            if self.bbox:
+                raw = ox.features_from_bbox(bbox=self.bbox, tags=tags)
+            else:
+                raw = ox.features_from_point(
+                    self.center_point, tags=tags, dist=self.dist
+                )
+
+            self.cache.set("features", payload, raw)
+
+            projected = self._project(raw.copy())
+            elapsed = time.perf_counter() - t0
+            self._audit_geodataframe(
+                projected, layer_name, elapsed, source="OSM"
+            )
+            return self._clip_to_canvas(projected, layer_name=layer_name)
+
+        except Exception as exc:
+            err_msg = str(exc).lower()
+            no_data_keywords = [
+                "no data",
+                "empty",
+                "insufficient",
+                "not find",
+                "no features",
+            ]
+
+            if any(keyword in err_msg for keyword in no_data_keywords):
+                logger.info("No features found for '%s'.", layer_name)
+                return None
+
+            logger.error(
+                "Fatal error while fetching '%s': %s", layer_name, exc
+            )
+            raise
+
+    # ------------------------------------------------------------------
+    # Canvas construction
+    # ------------------------------------------------------------------
+
+    def _create_figure(self, base_width):
+        """
+        Create the Matplotlib figure (base_width in INCHES).
+        Reserves breathing room around the axes so titles and grid
+        labels are never clipped off the canvas.
+        """
+        ground_w_m, ground_h_m = _compute_ground_metrics(
+            self.minx,
+            self.miny,
+            self.maxx,
+            self.maxy,
+            self.crs,
+        )
+
+        if ground_w_m <= 0 or ground_h_m <= 0:
+            raise ValueError("Map bounds have zero ground extent.")
+
+        aspect_ratio = ground_h_m / ground_w_m
+        fig_height = base_width * aspect_ratio
+
+        self.fig, self.ax = plt.subplots(figsize=(base_width, fig_height))
+
+        # Leave margins so top titles and right/top grid labels stay inside the figure
+        self.fig.subplots_adjust(
+            left=0.02,
+            right=0.95,
+            bottom=0.02,
+            top=0.90,
+        )
+
+        self._is_user_ax = False
+
+        logger.info(
+            "New canvas initialized: %.2f x %.2f inches.",
+            base_width,
+            fig_height,
+        )
+
+    def _attach_user_axes(self, ax):
+        """Use an externally supplied Matplotlib Axes."""
+        self.ax = ax
+        self.fig = ax.figure
+        self._is_user_ax = True
+
+    def _configure_axes(self):
+        """Apply map bounds, zero margins, background, and aspect."""
         self.ax.set_xlim([self.minx, self.maxx])
         self.ax.set_ylim([self.miny, self.maxy])
+        self.ax.margins(0)
         self.ax.set_facecolor(self.bg_color)
 
         if self.crs == "EPSG:4326":
-            self.ax.set_aspect(1.0 / math.cos(math.radians((self.miny + self.maxy) / 2.0))) 
+            center_lat = (self.miny + self.maxy) / 2.0
+            self.ax.set_aspect(1.0 / math.cos(math.radians(center_lat)))
         else:
-            self.ax.set_aspect('equal') 
+            self.ax.set_aspect("equal")
+
+    def _build_render_context(self):
+        """Measure the actual rendered axes and create RenderContext."""
+        axes_width_in, axes_height_in = _get_actual_ax_size_in(
+            self.fig, self.ax
+        )
+
+        ground_width_m, ground_height_m = _compute_ground_metrics(
+            self.minx,
+            self.miny,
+            self.maxx,
+            self.maxy,
+            self.crs,
+        )
+
+        scale_x = ground_width_m / (axes_width_in * 0.0254)
+        scale_y = ground_height_m / (axes_height_in * 0.0254)
+
+        map_span_x = self.maxx - self.minx
+        map_span_y = self.maxy - self.miny
+
+        units_per_meter_x = (
+            map_span_x / ground_width_m if ground_width_m else 0.0
+        )
+        units_per_meter_y = (
+            map_span_y / ground_height_m if ground_height_m else 0.0
+        )
+
+        self.render_context = RenderContext(
+            ground_width_m=ground_width_m,
+            ground_height_m=ground_height_m,
+            axes_width_in=axes_width_in,
+            axes_height_in=axes_height_in,
+            scale_x=scale_x,
+            scale_y=scale_y,
+            map_units_per_ground_meter_x=units_per_meter_x,
+            map_units_per_ground_meter_y=units_per_meter_y,
+            dpi=self.fig.dpi,
+        )
+
+        logger.info(
+            "Render context: axes %.2f x %.2f in | scale H=1:%d V=1:%d",
+            axes_width_in,
+            axes_height_in,
+            int(scale_x),
+            int(scale_y),
+        )
+
+    def setup_canvas(
+        self,
+        ax=None,
+        base_width=16,
+        highway_filter=None,
+    ):
+        """Prepare the complete map canvas through modular setup stages."""
+        logger.info("Setting up map canvas...")
+
+        custom_filter = None
+        if highway_filter:
+            custom_filter = f'["highway"~"{"|".join(highway_filter)}"]'
+
+        # 1. Network acquisition
+        self.G = self._fetch_drive_graph(custom_filter=custom_filter)
+
+        # 2. Projection
+        self.G = self._project_graph(self.G)
+
+        # 3. Bounds calculation first (so network audit knows canvas span)
+        self.gdf_nodes, _ = ox.graph_to_gdfs(self.G, edges=False)
+        if self.gdf_nodes.empty:
+            raise ValueError("Invalid graph bounds: No road nodes found.")
+        self._calculate_bounds()
+
+        # 4. Graph -> GeoDataFrames & Edge Styling
+        self._prepare_network_geodata()
+
+        # 5/6. Canvas creation
+        if ax is None:
+            self._create_figure(base_width)
+        else:
+            self._attach_user_axes(ax)
+
+        # 7. Axes configuration
+        self._configure_axes()
+
+        # 8. Metric CRS for physical geometry
+        self._determine_metric_crs()
+
+        # 9. Actual physical rendering context
+        self._build_render_context()
 
         logger.info("Canvas setup complete.")
         return self
 
+    # ------------------------------------------------------------------
+    # Style / linewidth helpers
+    # ------------------------------------------------------------------
+
+    def _get_stroke_width(self, base_width_pt: float) -> float:
+        """Return the final stroke width in POINTS."""
+        roads = self.style.roads
+        return _adaptive_width(
+            base_width_pt=base_width_pt,
+            render_context=self.render_context,
+            adaptive=roads.adaptive_widths,
+            reference_scale=roads.reference_scale,
+            exponent=roads.width_scale_exponent,
+            minimum_pt=roads.minimum_width_pt,
+            maximum_pt=roads.maximum_width_pt,
+        )
+
+    # ------------------------------------------------------------------
+    # Generic layers
+    # ------------------------------------------------------------------
+
     def draw_land(self):
-        """
-        Draw the base land layer.
-        Ensures the polygon relies on the current canvas CRS to prevent projection failure.
-        """
+        """Draw the map's base land rectangle."""
         logger.info("Drawing base land layer...")
-        if getattr(self, 'gdf_admin_base', None) is None:
-            # Use self.crs directly as boundaries are already in the projected system
+
+        if self.gdf_admin_base is None:
             poly = box(self.minx, self.miny, self.maxx, self.maxy)
-            self.gdf_admin_base = gpd.GeoDataFrame(geometry=[poly], crs=self.crs)
-            logger.debug(f"Land bounding box polygon created with CRS {self.crs}")
-            
+            self.gdf_admin_base = gpd.GeoDataFrame(
+                geometry=[poly], crs=self.crs
+            )
+
         if not self.gdf_admin_base.empty:
-            self.gdf_admin_base.plot(ax=self.ax, color=self.land_color, zorder=0.1)
-            logger.info("Land layer successfully rendered.")
+            self.gdf_admin_base.plot(
+                ax=self.ax,
+                color=self.style.base.land,
+                zorder=self.style.base.land_zorder,
+            )
+
         return self
 
     def draw_water(self):
+        """Retrieve and draw OSM water features."""
         logger.info("Drawing water features...")
+
         if self.gdf_water is None:
-            tags = {'natural': ['water', 'bay', 'coastline'], 'waterway': ['river', 'riverbank', 'canal', 'dock'], 'water': True}
+            tags = {
+                "natural": ["water", "bay", "coastline"],
+                "waterway": ["river", "riverbank", "canal", "dock"],
+                "water": True,
+            }
             self.gdf_water = self._fetch_features(tags, layer_name="water")
-            
+
         if self.gdf_water is not None and not self.gdf_water.empty:
-            self.gdf_water.plot(ax=self.ax, color=self.bg_color, edgecolor='none', zorder=0.2)
-            logger.info(f"Rendered {len(self.gdf_water)} water features.")
-        else:
-            logger.debug("No water features found to render.")
+            self.gdf_water.plot(
+                ax=self.ax,
+                color=self.style.base.water,
+                edgecolor="none",
+                zorder=self.style.base.water_zorder,
+            )
+
         return self
 
     def draw_greenery(self):
+        """Retrieve and draw generic greenery polygons."""
         logger.info("Drawing greenery features...")
-        if getattr(self, 'gdf_greenery', None) is None:
-            tags = {'leisure': ['park', 'pitch', 'garden', 'golf_course'], 'landuse': ['forest', 'grass', 'cemetery', 'recreation_ground'], 'natural': ['wood', 'scrub']}
-            self.gdf_greenery = self._fetch_features(tags, layer_name="greenery")
+
+        if self.gdf_greenery is None:
+            tags = {
+                "leisure": ["park", "pitch", "garden", "golf_course"],
+                "landuse": ["forest", "grass", "cemetery", "recreation_ground"],
+                "natural": ["wood", "scrub"],
+            }
+            self.gdf_greenery = self._fetch_features(
+                tags, layer_name="greenery"
+            )
 
         if self.gdf_greenery is not None and not self.gdf_greenery.empty:
-            poly_gdf = self.gdf_greenery[self.gdf_greenery.geometry.type.isin(['Polygon', 'MultiPolygon'])]
+            poly_gdf = self.gdf_greenery[
+                self.gdf_greenery.geometry.type.isin(["Polygon", "MultiPolygon"])
+            ]
+
             if not poly_gdf.empty:
-                poly_gdf.plot(ax=self.ax, color='#86efac', alpha=0.35, edgecolor='none', zorder=0.15)
-                logger.info(f"Rendered {len(poly_gdf)} greenery polygons.")
-            else:
-                logger.debug("Greenery features found, but no valid polygons to render.")
-        else:
-            logger.debug("No greenery features found to render.")
+                poly_gdf.plot(
+                    ax=self.ax,
+                    color=self.style.base.greenery,
+                    alpha=self.style.base.greenery_alpha,
+                    edgecolor="none",
+                    zorder=self.style.base.greenery_zorder,
+                )
+
         return self
 
     def draw_buildings(self):
+        """Retrieve and draw generic building footprints."""
         logger.info("Drawing building footprints...")
-        if getattr(self, 'gdf_buildings', None) is None:
-            tags = {'building': True}
-            self.gdf_buildings = self._fetch_features(tags, layer_name="buildings")
 
-        if self.gdf_buildings is not None and not self.gdf_buildings.empty:
-            poly_gdf = self.gdf_buildings[self.gdf_buildings.geometry.type.isin(['Polygon', 'MultiPolygon'])]
-            if not poly_gdf.empty:
-                logger.debug("Separating buildings into commercial and residential/other categories.")
-                is_commercial = poly_gdf['building'].isin(['commercial', 'retail', 'office', 'hotel', 'supermarket'])
-                bldg_comm, bldg_resi = poly_gdf[is_commercial], poly_gdf[~is_commercial]
-                
-                if not bldg_resi.empty: 
-                    bldg_resi.plot(ax=self.ax, color='#cbd5e1', alpha=0.45, edgecolor='none', zorder=0.17)
-                if not bldg_comm.empty: 
-                    bldg_comm.plot(ax=self.ax, color='#fca5a5', alpha=0.65, edgecolor='none', zorder=0.18)
-                
-                logger.info(f"Rendered {len(bldg_comm)} commercial and {len(bldg_resi)} residential buildings.")
-        else:
-            logger.debug("No building footprints found to render.")
+        if self.gdf_buildings is None:
+            self.gdf_buildings = self._fetch_features(
+                {"building": True}, layer_name="buildings"
+            )
+
+        if self.gdf_buildings is None or self.gdf_buildings.empty:
+            return self
+
+        poly_gdf = self.gdf_buildings[
+            self.gdf_buildings.geometry.type.isin(["Polygon", "MultiPolygon"])
+        ]
+
+        if poly_gdf.empty:
+            return self
+
+        is_commercial = poly_gdf["building"].isin(
+            ["commercial", "retail", "office", "hotel", "supermarket"]
+        )
+
+        bldg_comm = poly_gdf[is_commercial]
+        bldg_resi = poly_gdf[~is_commercial]
+
+        if not bldg_resi.empty:
+            bldg_resi.plot(
+                ax=self.ax,
+                color=self.style.base.building_residential,
+                alpha=self.style.base.building_residential_alpha,
+                edgecolor="none",
+                zorder=self.style.base.residential_building_zorder,
+            )
+
+        if not bldg_comm.empty:
+            bldg_comm.plot(
+                ax=self.ax,
+                color=self.style.base.building_commercial,
+                alpha=self.style.base.building_commercial_alpha,
+                edgecolor="none",
+                zorder=self.style.base.commercial_building_zorder,
+            )
+
         return self
 
     def draw_roads(self):
-        logger.info("Drawing road network (tunnels, ground, bridges)...")
-        gdf_tunnels = self.gdf_edges[self.gdf_edges['custom_zorder'] == 1]
-        gdf_ground = self.gdf_edges[self.gdf_edges['custom_zorder'] == 2]
-        gdf_bridges = self.gdf_edges[self.gdf_edges['custom_zorder'] == 3]
+        """Draw the processed road network (linewidth in POINTS)."""
+        logger.info("Drawing road network...")
 
-        if not gdf_tunnels.empty: 
-            gdf_tunnels.plot(ax=self.ax, color=gdf_tunnels['custom_color'], linewidth=gdf_tunnels['custom_width'], zorder=1.0, linestyle='--')
-        if not gdf_ground.empty: 
-            gdf_ground.plot(ax=self.ax, color=gdf_ground['custom_color'], linewidth=gdf_ground['custom_width'], zorder=2.0)
-        if not gdf_bridges.empty: 
-            gdf_bridges.plot(ax=self.ax, color=gdf_bridges['custom_color'], linewidth=gdf_bridges['custom_width'], zorder=3.0)
-            
-        logger.info(f"Road network rendered ({len(gdf_tunnels)} tunnels, {len(gdf_ground)} ground, {len(gdf_bridges)} bridges).")
+        if self.gdf_edges is None:
+            raise ValueError(
+                "Road network is not prepared. Call setup_canvas() first."
+            )
+
+        tunnels = self.gdf_edges[
+            self.gdf_edges["custom_zorder"] == self.style.roads.tunnel_zorder
+        ]
+        ground = self.gdf_edges[
+            self.gdf_edges["custom_zorder"] == self.style.roads.ground_zorder
+        ]
+        bridges = self.gdf_edges[
+            self.gdf_edges["custom_zorder"] == self.style.roads.bridge_zorder
+        ]
+
+        def render_group(gdf, zorder, linestyle="-"):
+            if gdf.empty:
+                return
+
+            linewidths = gdf["custom_width_pt"].map(self._get_stroke_width)
+            gdf.plot(
+                ax=self.ax,
+                color=gdf["custom_color"],
+                linewidth=linewidths,
+                zorder=zorder,
+                linestyle=linestyle,
+            )
+
+        render_group(tunnels, self.style.roads.tunnel_zorder, "--")
+        render_group(ground, self.style.roads.ground_zorder)
+        render_group(bridges, self.style.roads.bridge_zorder)
+
+        logger.info("Road network rendered.")
         return self
 
-    def draw_airports(self):
-        logger.info("Drawing airport features...")
-        if getattr(self, 'gdf_aeroway', None) is None:
-            tags = {'aeroway': ['runway', 'taxiway', 'apron', 'helipad']}
-            self.gdf_aeroway = self._fetch_features(tags, layer_name="airports")
+    # ------------------------------------------------------------------
+    # Airport rendering
+    # ------------------------------------------------------------------
 
-        if self.gdf_aeroway is None or self.gdf_aeroway.empty: 
-            logger.debug("No airport features found to render.")
-            return self
+    def _parse_width_m(self, value, default_width_m: float) -> float:
+        """Parse an OSM width value into physical metres."""
+        if pd.isna(value):
+            return default_width_m
 
-        scale_factor = self.fig.get_figwidth() / 72.0
-        poly_gdf = self.gdf_aeroway[self.gdf_aeroway.geometry.type.isin(['Polygon', 'MultiPolygon'])]
-        line_gdf = self.gdf_aeroway[~self.gdf_aeroway.geometry.type.isin(['Polygon', 'MultiPolygon'])]
+        text = str(value).strip()
+        if not text:
+            return default_width_m
+
+        match = re.search(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)", text)
+        if not match:
+            return default_width_m
+
+        try:
+            parsed = float(match.group(0))
+        except ValueError:
+            return default_width_m
+
+        return parsed if parsed > 0 else default_width_m
+
+    def _prepare_airport_surface_geometries(self, poly_gdf, line_gdf):
+        """Convert airport linear features into physical surface polygons in metric_crs."""
+        airport_style = self.style.airports
+        final_surfaces = {"runway": [], "taxiway": []}
 
         if not poly_gdf.empty:
-            logger.debug("Rendering airport aprons and areas...")
-            aprons = poly_gdf[poly_gdf['aeroway'] == 'apron']
-            if not aprons.empty: 
-                aprons.plot(ax=self.ax, color='#d4d4d8', zorder=0.4, edgecolor='none')
-            aero_areas = poly_gdf[poly_gdf['aeroway'].isin(['runway', 'taxiway'])]
-            if not aero_areas.empty: 
-                aero_areas.plot(ax=self.ax, color='#52525b', zorder=0.45, edgecolor='none')
+            metric_polys = self._to_metric(poly_gdf)
+            for _, row in metric_polys.iterrows():
+                aeroway = row.get("aeroway")
+                if aeroway in final_surfaces:
+                    final_surfaces[aeroway].append(row.geometry)
 
         if not line_gdf.empty:
-            logger.debug("Rendering airport taxiways and runways...")
-            taxiways, runways = line_gdf[line_gdf['aeroway'] == 'taxiway'], line_gdf[line_gdf['aeroway'] == 'runway']
+            metric_lines = self._to_metric(line_gdf)
+            for source_idx, metric_row in metric_lines.iterrows():
+                aeroway = line_gdf.loc[source_idx, "aeroway"]
+                if aeroway not in final_surfaces:
+                    continue
+
+                geom = metric_row.geometry
+                if geom is None or geom.is_empty:
+                    continue
+
+                default_width = (
+                    airport_style.default_runway_width_m
+                    if aeroway == "runway"
+                    else airport_style.default_taxiway_width_m
+                )
+
+                width_m = self._parse_width_m(
+                    line_gdf.loc[source_idx, "width"],
+                    default_width,
+                )
+
+                final_surfaces[aeroway].append(geom.buffer(width_m / 2.0))
+
+        return final_surfaces
+
+    def draw_airports(self):
+        """Draw airport physical surfaces (metres) and centerlines (points)."""
+        logger.info("Drawing airport features...")
+
+        if self.gdf_aeroway is None:
+            self.gdf_aeroway = self._fetch_features(
+                {"aeroway": ["runway", "taxiway", "apron", "helipad"]},
+                layer_name="airports",
+            )
+
+        if self.gdf_aeroway is None or self.gdf_aeroway.empty:
+            return self
+
+        airport_style = self.style.airports
+
+        poly_gdf = self.gdf_aeroway[
+            self.gdf_aeroway.geometry.type.isin(["Polygon", "MultiPolygon"])
+        ]
+        line_gdf = self.gdf_aeroway[
+            ~self.gdf_aeroway.geometry.type.isin(["Polygon", "MultiPolygon"])
+        ]
+
+        if not poly_gdf.empty:
+            aprons = poly_gdf[poly_gdf["aeroway"] == "apron"]
+            if not aprons.empty:
+                aprons.plot(
+                    ax=self.ax,
+                    color=airport_style.apron_color,
+                    zorder=airport_style.apron_zorder,
+                    edgecolor="none",
+                )
+
+        surfaces = self._prepare_airport_surface_geometries(poly_gdf, line_gdf)
+
+        if surfaces["taxiway"]:
+            metric_gdf = gpd.GeoDataFrame(
+                geometry=surfaces["taxiway"], crs=self.metric_crs
+            )
+            metric_gdf.to_crs(self.crs).plot(
+                ax=self.ax,
+                color=airport_style.taxiway_surface_color,
+                zorder=airport_style.taxiway_zorder,
+                edgecolor="none",
+            )
+
+        if surfaces["runway"]:
+            metric_gdf = gpd.GeoDataFrame(
+                geometry=surfaces["runway"], crs=self.metric_crs
+            )
+            metric_gdf.to_crs(self.crs).plot(
+                ax=self.ax,
+                color=airport_style.runway_surface_color,
+                zorder=airport_style.runway_zorder,
+                edgecolor="none",
+            )
+
+        if not line_gdf.empty:
+            taxiways = line_gdf[line_gdf["aeroway"] == "taxiway"]
+            runways = line_gdf[line_gdf["aeroway"] == "runway"]
+
             if not taxiways.empty:
-                taxiways.plot(ax=self.ax, color='#71717a', linewidth=4.0 * scale_factor, zorder=0.46)
-                taxiways.plot(ax=self.ax, color='#fde047', linewidth=0.8 * scale_factor, zorder=0.47)
+                taxiways.plot(
+                    ax=self.ax,
+                    color=airport_style.taxiway_centerline_color,
+                    linewidth=self._get_stroke_width(
+                        airport_style.taxiway_centerline_width_pt
+                    ),
+                    zorder=airport_style.taxiway_centerline_zorder,
+                )
+
             if not runways.empty:
-                runways.plot(ax=self.ax, color='#3f3f46', linewidth=14.0 * scale_factor, zorder=0.48)
-                runways.plot(ax=self.ax, color='#ffffff', linewidth=1.5 * scale_factor, linestyle=(0, (10, 10)), zorder=0.49)
+                runways.plot(
+                    ax=self.ax,
+                    color=airport_style.runway_centerline_color,
+                    linewidth=self._get_stroke_width(
+                        airport_style.runway_centerline_width_pt
+                    ),
+                    linestyle=(0, (10, 10)),
+                    zorder=airport_style.runway_centerline_zorder,
+                )
 
-            logger.debug("Processing airport reference markings...")
             placed_markings = []
-            for idx, row in line_gdf.iterrows():
-                if 'ref' not in row or pd.isna(row['ref']) or not str(row['ref']).strip(): continue
+
+            for _, row in line_gdf.iterrows():
+                ref = row.get("ref")
+                if pd.isna(ref) or not str(ref).strip():
+                    continue
+
                 geom = row.geometry
-                if geom.is_empty: continue
+                if geom is None or geom.is_empty:
+                    continue
 
-                center_pt = geom.centroid
+                center_pt = geom.representative_point()
                 x, y = center_pt.x, center_pt.y
-                if not (self.minx <= x <= self.maxx and self.miny <= y <= self.maxy): continue
 
-                coords = list(geom.coords) if geom.geom_type == 'LineString' else (list(geom.geoms[0].coords) if geom.geom_type == 'MultiLineString' else [])
-                if len(coords) < 2: continue
-                angle = math.degrees(math.atan2(coords[-1][1] - coords[0][1], coords[-1][0] - coords[0][0]))
-                if angle > 90: angle -= 180
-                elif angle < -90: angle += 180
+                if not (
+                    self.minx <= x <= self.maxx and self.miny <= y <= self.maxy
+                ):
+                    continue
 
-                is_rw = row.get('aeroway') == 'runway'
-                fontsize, fontcolor, fontweight, z = (int(12 * scale_factor), '#ffffff', 'bold', 4.5) if is_rw else (int(7 * scale_factor), '#fde047', 'bold', 4.5)
-                bbox_style = dict(facecolor='#3f3f46' if is_rw else '#71717a', alpha=0.8, edgecolor='none', boxstyle='square,pad=0.1' if is_rw else 'round,pad=0.1')
+                coords = (
+                    list(geom.coords)
+                    if geom.geom_type == "LineString"
+                    else (
+                        list(geom.geoms[0].coords)
+                        if geom.geom_type == "MultiLineString"
+                        else []
+                    )
+                )
 
-                if any(math.hypot(x - px, y - py) < (self.maxx - self.minx) * 0.005 for px, py in placed_markings): continue
+                if len(coords) < 2:
+                    continue
+
+                angle = math.degrees(
+                    math.atan2(
+                        coords[-1][1] - coords[0][1],
+                        coords[-1][0] - coords[0][0],
+                    )
+                )
+                if angle > 90:
+                    angle -= 180
+                elif angle < -90:
+                    angle += 180
+
+                is_runway = row.get("aeroway") == "runway"
+                fontsize = (
+                    airport_style.runway_label_font_size_pt
+                    if is_runway
+                    else airport_style.taxiway_label_font_size_pt
+                )
+                fontcolor = (
+                    airport_style.runway_centerline_color
+                    if is_runway
+                    else airport_style.taxiway_centerline_color
+                )
+
+                if any(
+                    math.hypot(x - px, y - py)
+                    < (self.maxx - self.minx)
+                    * airport_style.label_collision_ratio
+                    for px, py in placed_markings
+                ):
+                    continue
+
                 placed_markings.append((x, y))
 
-                self.ax.text(x, y, str(row['ref']).strip(), color=fontcolor, fontsize=fontsize, ha='center', va='center', rotation=angle, zorder=z, clip_on=True, fontfamily='sans-serif', fontweight=fontweight, bbox=bbox_style)
-        
-        logger.info("Airport features successfully rendered.")
+                self.ax.text(
+                    x,
+                    y,
+                    str(ref).strip(),
+                    color=fontcolor,
+                    fontsize=fontsize,
+                    ha="center",
+                    va="center",
+                    rotation=angle,
+                    zorder=airport_style.label_zorder,
+                    clip_on=True,
+                    fontfamily="sans-serif",
+                    fontweight="bold",
+                )
+
+        logger.info("Airport rendering complete.")
         return self
 
-    def draw_grid(self, rows=5, cols=5, color="#8072ff", alpha=0.15, linewidth=0.8):
-        logger.info(f"Drawing map grid with {rows} rows and {cols} columns...")
-        if self.ax is None: 
-            logger.error("Attempted to draw grid before canvas was initialized.")
+    # ------------------------------------------------------------------
+    # Grid / coordinates / scale
+    # ------------------------------------------------------------------
+
+    def draw_grid(
+        self,
+        rows=5,
+        cols=5,
+        color=None,
+        alpha=None,
+        linewidth=None,
+    ):
+        """Draw the alphanumeric map grid (linewidth in POINTS)."""
+        if self.ax is None:
             raise ValueError("Canvas not found.")
 
+        style = self.style.grid
+
+        color = color if color is not None else style.color
+        alpha = alpha if alpha is not None else style.alpha
+        linewidth = linewidth if linewidth is not None else style.linewidth_pt
+
         self.grid_cells = {}
-        x_steps = [self.minx + i * (self.maxx - self.minx) / cols for i in range(cols + 1)]
-        y_steps = [self.miny + j * (self.maxy - self.miny) / rows for j in range(rows + 1)]
+
+        x_steps = [
+            self.minx + i * (self.maxx - self.minx) / cols
+            for i in range(cols + 1)
+        ]
+        y_steps = [
+            self.miny + j * (self.maxy - self.miny) / rows
+            for j in range(rows + 1)
+        ]
         cols_labels = [chr(65 + i) for i in range(cols)]
 
-        for i in range(cols + 1):
-            self.ax.plot([x_steps[i], x_steps[i]], [self.miny, self.maxy], color=color, alpha=alpha, linewidth=linewidth, linestyle='--', zorder=5.0)
-            if i < cols: 
-                self.ax.text(x_steps[i] + (self.maxx - self.minx) / (cols * 2.0), self.maxy, cols_labels[i], color=color, alpha=0.7, fontsize=9, ha='center', va='bottom', zorder=5.0, fontfamily='monospace')
+        for i, x in enumerate(x_steps):
+            self.ax.plot(
+                [x, x],
+                [self.miny, self.maxy],
+                color=color,
+                alpha=alpha,
+                linewidth=linewidth,
+                linestyle="--",
+                zorder=style.zorder,
+            )
 
-        for j in range(rows + 1):
-            self.ax.plot([self.minx, self.maxx], [y_steps[j], y_steps[j]], color=color, alpha=alpha, linewidth=linewidth, linestyle='--', zorder=5.0)
-            if j < rows: 
-                self.ax.text(self.maxx, y_steps[j] + (self.maxy - self.miny) / (rows * 2.0), str(rows - j), color=color, alpha=0.7, fontsize=9, ha='left', va='center', zorder=5.0, fontfamily='monospace')
+            if i < cols:
+                self.ax.text(
+                    x + (self.maxx - self.minx) / (cols * 2.0),
+                    self.maxy,
+                    cols_labels[i],
+                    color=color,
+                    alpha=0.85,
+                    fontsize=style.font_size_pt,
+                    ha="center",
+                    va="bottom",
+                    zorder=style.zorder,
+                    fontfamily="monospace",
+                    fontweight="bold",
+                )
 
-        # Indexing grid cells for fast spatial lookups
+        for j, y in enumerate(y_steps):
+            self.ax.plot(
+                [self.minx, self.maxx],
+                [y, y],
+                color=color,
+                alpha=alpha,
+                linewidth=linewidth,
+                linestyle="--",
+                zorder=style.zorder,
+            )
+
+            if j < rows:
+                self.ax.text(
+                    self.maxx,
+                    y + (self.maxy - self.miny) / (rows * 2.0),
+                    str(rows - j),
+                    color=color,
+                    alpha=0.85,
+                    fontsize=style.font_size_pt,
+                    ha="left",
+                    va="center",
+                    zorder=style.zorder,
+                    fontfamily="monospace",
+                    fontweight="bold",
+                )
+
         for i in range(cols):
             for j in range(rows):
-                self.grid_cells[f"{cols_labels[i]}{rows - j}"] = (x_steps[i], y_steps[j], x_steps[i+1], y_steps[j+1])
-        
-        logger.info("Map grid rendered and indexed.")
+                self.grid_cells[f"{cols_labels[i]}{rows - j}"] = (
+                    x_steps[i],
+                    y_steps[j],
+                    x_steps[i + 1],
+                    y_steps[j + 1],
+                )
+
         return self
 
     def draw_coordinates(self):
-        logger.info("Calculating and drawing geographic coordinate tick marks (DMS)...")
-        if self.ax is None: raise ValueError("Canvas not found.")
+        """Draw geographic DMS coordinate ticks along map borders."""
+        if self.ax is None:
+            raise ValueError("Canvas not found.")
 
         if self.crs != "EPSG:4326":
-            logger.debug(f"Transforming coordinates from {self.crs} to WGS84 for tick calculation.")
-            to_wgs84 = Transformer.from_crs(self.crs, "EPSG:4326", always_xy=True)
-            to_map = Transformer.from_crs("EPSG:4326", self.crs, always_xy=True)
+            to_wgs84 = Transformer.from_crs(
+                self.crs, "EPSG:4326", always_xy=True
+            )
+            to_map = Transformer.from_crs(
+                "EPSG:4326", self.crs, always_xy=True
+            )
             w, s = to_wgs84.transform(self.minx, self.miny)
             e, n = to_wgs84.transform(self.maxx, self.maxy)
         else:
@@ -489,93 +1410,363 @@ class GenericMapPlotter:
             to_map = None
 
         span = min(e - w, n - s)
-        interval = 1 / 120.0 if span < 0.05 else (1 / 60.0 if span < 0.1 else (5 / 60.0 if span < 0.5 else 0.1))
-        logger.debug(f"Determined coordinate interval to be {interval} degrees based on map span.")
+        interval = (
+            1 / 120.0
+            if span < 0.05
+            else (
+                1 / 60.0
+                if span < 0.1
+                else (5 / 60.0 if span < 0.5 else 0.1)
+            )
+        )
 
-        def format_dms(val_orig, is_lat):
-            val = abs(val_orig)
-            deg, mins_float = int(val), (val - int(val)) * 60
-            mins, secs = int(mins_float), int(round((mins_float - int(mins_float)) * 60))
-            if secs >= 60: secs, mins = 0, mins + 1
-            if mins >= 60: mins, deg = 0, deg + 1
-            dir_str = ('N' if val_orig >= 0 else 'S') if is_lat else ('E' if val_orig >= 0 else 'W')
-            return f"{deg}°{mins}'{secs}\"{dir_str}" if secs > 0 else (f"{deg}°{mins}'{dir_str}" if mins > 0 else f"{deg}°{dir_str}")
+        def format_dms(value, is_lat):
+            value_abs = abs(value)
+            deg = int(value_abs)
+            mins_float = (value_abs - deg) * 60
+            mins = int(mins_float)
+            secs = int(round((mins_float - mins) * 60))
+
+            if secs >= 60:
+                secs = 0
+                mins += 1
+            if mins >= 60:
+                mins = 0
+                deg += 1
+
+            direction = (
+                ("N" if value >= 0 else "S")
+                if is_lat
+                else ("E" if value >= 0 else "W")
+            )
+
+            if secs > 0:
+                return f'{deg}°{mins}\'{secs}"{direction}'
+            if mins > 0:
+                return f"{deg}°{mins}'{direction}"
+            return f"{deg}°{direction}"
 
         lon_ticks, lat_ticks = [], []
         curr_lon = math.ceil(w / interval) * interval
-        while curr_lon <= e: 
+        while curr_lon <= e:
             lon_ticks.append(curr_lon)
             curr_lon += interval
-        
+
         curr_lat = math.ceil(s / interval) * interval
-        while curr_lat <= n: 
+        while curr_lat <= n:
             lat_ticks.append(curr_lat)
             curr_lat += interval
 
-        scale_factor = self.fig.get_figwidth() / 72.0
-        fontsize, color, halo = max(6, int(7 * scale_factor)), "#e2e8f0", [pe.withStroke(linewidth=2.5 * scale_factor, foreground="#091c15")]
-        tick_len_x, tick_len_y = (self.maxx - self.minx) * 0.005, (self.maxy - self.miny) * 0.005
+        style = self.style.coordinates
+        halo = [
+            pe.withStroke(
+                linewidth=style.halo_width_pt,
+                foreground="#091c15",
+            )
+        ]
+
+        tick_len_x = (self.maxx - self.minx) * 0.005
+        tick_len_y = (self.maxy - self.miny) * 0.005
 
         for lon in lon_ticks:
-            px = max(self.minx, min(to_map.transform(lon, s)[0] if to_map else lon, self.maxx))
-            self.ax.plot([px, px], [self.miny, self.miny + tick_len_y], color=color, linewidth=1.2 * scale_factor, zorder=8)
-            self.ax.plot([px, px], [self.maxy, self.maxy - tick_len_y], color=color, linewidth=1.2 * scale_factor, zorder=8)
-            self.ax.text(px, self.miny + tick_len_y * 1.5, format_dms(lon, False), color=color, fontsize=fontsize, ha='center', va='bottom', fontfamily='monospace', zorder=8.5, fontweight='bold', path_effects=halo)
-            self.ax.text(px, self.maxy - tick_len_y * 1.5, format_dms(lon, False), color=color, fontsize=fontsize, ha='center', va='top', fontfamily='monospace', zorder=8.5, fontweight='bold', path_effects=halo)
+            px = max(
+                self.minx,
+                min(
+                    to_map.transform(lon, s)[0] if to_map else lon,
+                    self.maxx,
+                ),
+            )
+
+            self.ax.plot(
+                [px, px],
+                [self.miny, self.miny + tick_len_y],
+                color=style.color,
+                linewidth=style.line_width_pt,
+                zorder=style.zorder,
+            )
+            self.ax.plot(
+                [px, px],
+                [self.maxy, self.maxy - tick_len_y],
+                color=style.color,
+                linewidth=style.line_width_pt,
+                zorder=style.zorder,
+            )
+
+            label = format_dms(lon, False)
+            self.ax.text(
+                px,
+                self.miny + tick_len_y * 1.5,
+                label,
+                color=style.color,
+                fontsize=style.font_size_pt,
+                ha="center",
+                va="bottom",
+                fontfamily=style.font_family,
+                zorder=style.text_zorder,
+                fontweight="bold",
+                path_effects=halo,
+            )
+            self.ax.text(
+                px,
+                self.maxy - tick_len_y * 1.5,
+                label,
+                color=style.color,
+                fontsize=style.font_size_pt,
+                ha="center",
+                va="top",
+                fontfamily=style.font_family,
+                zorder=style.text_zorder,
+                fontweight="bold",
+                path_effects=halo,
+            )
 
         for lat in lat_ticks:
-            py = max(self.miny, min(to_map.transform(w, lat)[1] if to_map else lat, self.maxy))
-            self.ax.plot([self.minx, self.minx + tick_len_x], [py, py], color=color, linewidth=1.2 * scale_factor, zorder=8)
-            self.ax.plot([self.maxx, self.maxx - tick_len_x], [py, py], color=color, linewidth=1.2 * scale_factor, zorder=8)
-            self.ax.text(self.minx + tick_len_x * 1.5, py, format_dms(lat, True), color=color, fontsize=fontsize, ha='left', va='center', fontfamily='monospace', zorder=8.5, fontweight='bold', path_effects=halo)
-            self.ax.text(self.maxx - tick_len_x * 1.5, py, format_dms(lat, True), color=color, fontsize=fontsize, ha='right', va='center', fontfamily='monospace', zorder=8.5, fontweight='bold', path_effects=halo)
+            py = max(
+                self.miny,
+                min(
+                    to_map.transform(w, lat)[1] if to_map else lat,
+                    self.maxy,
+                ),
+            )
 
-        logger.info("Coordinates borders successfully rendered.")
+            self.ax.plot(
+                [self.minx, self.minx + tick_len_x],
+                [py, py],
+                color=style.color,
+                linewidth=style.line_width_pt,
+                zorder=style.zorder,
+            )
+            self.ax.plot(
+                [self.maxx, self.maxx - tick_len_x],
+                [py, py],
+                color=style.color,
+                linewidth=style.line_width_pt,
+                zorder=style.zorder,
+            )
+
+            label = format_dms(lat, True)
+            self.ax.text(
+                self.minx + tick_len_x * 1.5,
+                py,
+                label,
+                color=style.color,
+                fontsize=style.font_size_pt,
+                ha="left",
+                va="center",
+                fontfamily=style.font_family,
+                zorder=style.text_zorder,
+                fontweight="bold",
+                path_effects=halo,
+            )
+            self.ax.text(
+                self.maxx - tick_len_x * 1.5,
+                py,
+                label,
+                color=style.color,
+                fontsize=style.font_size_pt,
+                ha="right",
+                va="center",
+                fontfamily=style.font_family,
+                zorder=style.text_zorder,
+                fontweight="bold",
+                path_effects=halo,
+            )
+
         return self
 
-    def draw_scale(self, x_offset=0.08, y_offset=0.08, color="white", font_size=9):
-        logger.info("Drawing map scale bars and North indicator...")
-        if self.ax is None or self.fig is None: raise ValueError("Canvas not found.")
-        self.fig.canvas.draw() if self.fig.canvas else None
+    def draw_scale(
+        self,
+        x_offset=None,
+        y_offset=None,
+        color=None,
+        font_size=None,
+    ):
+        """Draw horizontal/vertical scale bars and north arrow."""
+        if self.ax is None or self.fig is None:
+            raise ValueError("Canvas not found.")
 
-        map_w, map_h = _get_actual_ax_size_cm(self.fig, self.ax)
-        grd_w, grd_h = _compute_ground_metrics(self.minx, self.miny, self.maxx, self.maxy, self.crs)
+        style = self.style.scale
 
-        sc_x, sc_y = grd_w / (map_w * 0.01), grd_h / (map_h * 0.01)
-        u_x, u_y = (self.maxx - self.minx) / map_w, (self.maxy - self.miny) / map_h 
-        gm_x, gm_y = sc_x * 0.01, sc_y * 0.01
+        x_offset = style.x_offset_ratio if x_offset is None else x_offset
+        y_offset = style.y_offset_ratio if y_offset is None else y_offset
+        color = style.color if color is None else color
+        font_size = style.font_size_pt if font_size is None else font_size
 
-        bar_len_x, bar_len_y = u_x * 2.0, u_y * 2.0
-        ax_x, ax_y = self.maxx - (self.maxx - self.minx) * x_offset, self.miny + (self.maxy - self.miny) * y_offset
-        sx, sy = ax_x - bar_len_x, ax_y + bar_len_y
-        tick_h, tick_w = (self.maxy - self.miny) * 0.004, (self.maxx - self.minx) * 0.004
+        context = self.render_context
+        if context is None:
+            raise ValueError("Render context is unavailable.")
 
-        logger.debug("Applying horizontal scale elements.")
-        self.ax.plot([sx, ax_x], [ax_y, ax_y], color=color, linewidth=2.0, zorder=10)
-        for cx in [sx, sx + bar_len_x/2.0, ax_x]: 
-            self.ax.plot([cx, cx], [ax_y - tick_h, ax_y + tick_h], color=color, linewidth=1.5, zorder=10)
-        for tx, val in zip([sx, sx + bar_len_x/2.0, ax_x], ["0", f"{gm_x:.0f}m", f"{gm_x*2:.0f}m"]): 
-            self.ax.text(tx, ax_y - tick_h*1.8, val, color=color, fontsize=font_size, ha='center', va='top', zorder=10, fontfamily='monospace', fontweight='bold')
-        self.ax.text(ax_x - bar_len_x/2.0, ax_y + tick_h*2.5, f"H Scale: 1:{int(sc_x):,}", color=color, fontsize=font_size, ha='center', va='bottom', zorder=10, fontfamily='monospace', fontweight='bold')
+        bar_length_x = (
+            style.bar_ground_length_m * context.map_units_per_ground_meter_x
+        )
+        bar_length_y = (
+            style.bar_ground_length_m * context.map_units_per_ground_meter_y
+        )
 
-        logger.debug("Applying vertical scale elements.")
-        self.ax.plot([ax_x, ax_x], [ax_y, sy], color=color, linewidth=2.0, zorder=10)
-        for cy in [ax_y, ax_y + bar_len_y/2.0, sy]: 
-            self.ax.plot([ax_x - tick_w, ax_x + tick_w], [cy, cy], color=color, linewidth=1.5, zorder=10)
-        for ty, val in zip([ax_y, ax_y + bar_len_y/2.0, sy], ["0", f"{gm_y:.0f}m", f"{gm_y*2:.0f}m"]): 
-            self.ax.text(ax_x + tick_w*1.8, ty, val, color=color, fontsize=font_size, ha='left', va='center', zorder=10, fontfamily='monospace', fontweight='bold')
-        self.ax.text(ax_x + tick_w*4.5, ax_y + bar_len_y/2.0, f"V Scale: 1:{int(sc_y):,}", color=color, fontsize=font_size, ha='center', va='center', rotation=90, zorder=10, fontfamily='monospace', fontweight='bold')
+        ax_x = self.maxx - (self.maxx - self.minx) * x_offset
+        ax_y = self.miny + (self.maxy - self.miny) * y_offset
 
-        logger.debug("Applying North indicator arrow.")
-        nx, ny, arr_sz = ax_x - bar_len_x/2.0, sy + u_y*0.8, u_y*0.5
-        self.ax.annotate('', xy=(nx, ny + arr_sz), xytext=(nx, ny), arrowprops=dict(facecolor=color, edgecolor=color, width=1.5, headwidth=6, headlength=8), zorder=10)
-        self.ax.text(nx, ny + arr_sz*1.3, "N", color=color, fontsize=font_size+2, ha='center', va='bottom', zorder=10, fontfamily='sans-serif', fontweight='bold')
+        sx = ax_x - bar_length_x
+        sy = ax_y + bar_length_y
 
-        logger.info("Scale rendering complete.")
+        tick_h = (self.maxy - self.miny) * 0.004
+        tick_w = (self.maxx - self.minx) * 0.004
+
+        thick_lw = style.thick_line_width_pt
+        thin_lw = style.thin_line_width_pt
+        z = style.zorder
+
+        halo = [pe.withStroke(linewidth=2.5, foreground="#f8fafc")]
+
+        self.ax.plot(
+            [sx, ax_x],
+            [ax_y, ax_y],
+            color=color,
+            linewidth=thick_lw,
+            zorder=z,
+        )
+
+        for cx in [sx, sx + bar_length_x / 2.0, ax_x]:
+            self.ax.plot(
+                [cx, cx],
+                [ax_y - tick_h, ax_y + tick_h],
+                color=color,
+                linewidth=thin_lw,
+                zorder=z,
+            )
+
+        half_ground = style.bar_ground_length_m / 2.0
+
+        for tx, value in zip(
+            [sx, sx + bar_length_x / 2.0, ax_x],
+            ["0", f"{half_ground:.0f}m", f"{style.bar_ground_length_m:.0f}m"],
+        ):
+            self.ax.text(
+                tx,
+                ax_y - tick_h * 1.8,
+                value,
+                color=color,
+                fontsize=font_size,
+                ha="center",
+                va="top",
+                zorder=z,
+                fontfamily="monospace",
+                fontweight="bold",
+                path_effects=halo,
+            )
+
+        self.ax.text(
+            ax_x - bar_length_x / 2.0,
+            ax_y + tick_h * 2.5,
+            f"H Scale: 1:{int(context.scale_x):,}",
+            color=color,
+            fontsize=font_size,
+            ha="center",
+            va="bottom",
+            zorder=z,
+            fontfamily="monospace",
+            fontweight="bold",
+            path_effects=halo,
+        )
+
+        self.ax.plot(
+            [ax_x, ax_x],
+            [ax_y, sy],
+            color=color,
+            linewidth=thick_lw,
+            zorder=z,
+        )
+
+        for cy in [ax_y, ax_y + bar_length_y / 2.0, sy]:
+            self.ax.plot(
+                [ax_x - tick_w, ax_x + tick_w],
+                [cy, cy],
+                color=color,
+                linewidth=thin_lw,
+                zorder=z,
+            )
+
+        for ty, value in zip(
+            [ax_y, ax_y + bar_length_y / 2.0, sy],
+            ["0", f"{half_ground:.0f}m", f"{style.bar_ground_length_m:.0f}m"],
+        ):
+            self.ax.text(
+                ax_x + tick_w * 1.8,
+                ty,
+                value,
+                color=color,
+                fontsize=font_size,
+                ha="left",
+                va="center",
+                zorder=z,
+                fontfamily="monospace",
+                fontweight="bold",
+                path_effects=halo,
+            )
+
+        self.ax.text(
+            ax_x + tick_w * 4.5,
+            ax_y + bar_length_y / 2.0,
+            f"V Scale: 1:{int(context.scale_y):,}",
+            color=color,
+            fontsize=font_size,
+            ha="center",
+            va="center",
+            rotation=90,
+            zorder=z,
+            fontfamily="monospace",
+            fontweight="bold",
+            path_effects=halo,
+        )
+
+        nx = ax_x - bar_length_x / 2.0
+        ny = sy + (bar_length_y / style.bar_ground_length_m * 500)
+        arr_sz = bar_length_y * 0.5
+
+        self.ax.annotate(
+            "",
+            xy=(nx, ny + arr_sz),
+            xytext=(nx, ny),
+            arrowprops=dict(
+                facecolor=color,
+                edgecolor=color,
+                width=1.5,
+                headwidth=6,
+                headlength=8,
+            ),
+            zorder=z,
+        )
+
+        self.ax.text(
+            nx,
+            ny + arr_sz * 1.3,
+            "N",
+            color=color,
+            fontsize=font_size + 2,
+            ha="center",
+            va="bottom",
+            zorder=z,
+            fontfamily="sans-serif",
+            fontweight="bold",
+            path_effects=halo,
+        )
+
         return self
 
     def render(self):
-        logger.info("Finalizing map rendering (turning off native axis lines).")
-        if self.ax is None: raise ValueError("Canvas not found.")
+        """
+        Finalize the map by strictly re-locking the viewport bounds
+        (preventing GeoPandas layers from auto-expanding the view)
+        and hiding native Matplotlib axes.
+        """
+        if self.ax is None:
+            raise ValueError("Canvas not found.")
+
+        self.ax.set_xlim([self.minx, self.maxx])
+        self.ax.set_ylim([self.miny, self.maxy])
         self.ax.set_axis_off()
+
+        # Recalculate context once more in case axes bounds shifted
+        self._build_render_context()
+
         return self
